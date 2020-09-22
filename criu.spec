@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.13
-Release:       6
+Release:       7
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -14,6 +14,10 @@ ExclusiveArch: x86_64 %{arm} ppc64le aarch64 s390x
 Requires:      %{name} = %{version}-%{release}
 Provides:      %{name}-libs = %{version}-%{release}
 Obsoletes:     %{name}-libs < %{version}-%{release}
+
+Patch0001:     0001-Fix-crit-encode-TypeError.patch
+Patch0002:     0002-Fix-crit-info-struct-unpack-error.patch
+Patch0003:     0003-Fix-crit-x-UnicodeDecodeError.patch
 
 %description
 Checkpoint/Restore in Userspace(CRIU),is a software tool for the linux operating system.
@@ -87,5 +91,8 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*}
 
 %changelog
+* Tue Sep 22 2020 lingsheng <lingsheng@huawei.com> - 3.13-7
+- Fix crit errors
+
 * Fri Apr 24 2020 wutao <wutao61@huawei.com> - 3.13-6
 - Package init
