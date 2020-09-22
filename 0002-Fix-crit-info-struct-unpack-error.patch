@@ -1,0 +1,25 @@
+From a1d4d678de01b0569e8d36894a8d60a8b75bb016 Mon Sep 17 00:00:00 2001
+From: lingsheng <lingsheng@huawei.com>
+Date: Tue, 22 Sep 2020 14:39:22 +0800
+Subject: [PATCH 2/3] Fix crit info struct unpack error
+
+---
+ lib/py/images/images.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/py/images/images.py b/lib/py/images/images.py
+index f4517d8..72205fe 100644
+--- a/lib/py/images/images.py
++++ b/lib/py/images/images.py
+@@ -171,7 +171,7 @@ class entry_handler:
+ 
+         while True:
+             buf = f.read(4)
+-            if buf == '':
++            if len(buf) == 0:
+                 break
+             size, = struct.unpack('i', buf)
+             f.seek(size, 1)
+-- 
+2.23.0
+
