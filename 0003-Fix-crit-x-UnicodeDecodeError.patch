@@ -1,0 +1,25 @@
+From b2eea766a1f41553b76fef8d669e288ff552d0ed Mon Sep 17 00:00:00 2001
+From: lingsheng <lingsheng@huawei.com>
+Date: Tue, 22 Sep 2020 14:40:35 +0800
+Subject: [PATCH 3/3] Fix crit x UnicodeDecodeError
+
+---
+ lib/py/cli.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/py/cli.py b/lib/py/cli.py
+index 966dd4e..f7bda23 100755
+--- a/lib/py/cli.py
++++ b/lib/py/cli.py
+@@ -25,7 +25,7 @@ def outf(opts):
+ 
+ 
+ def dinf(opts, name):
+-    return open(os.path.join(opts['dir'], name))
++    return open(os.path.join(opts['dir'], name), 'rb')
+ 
+ 
+ def decode(opts):
+-- 
+2.23.0
+
