@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.13
-Release:       7
+Release:       8
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -18,6 +18,13 @@ Obsoletes:     %{name}-libs < %{version}-%{release}
 Patch0001:     0001-Fix-crit-encode-TypeError.patch
 Patch0002:     0002-Fix-crit-info-struct-unpack-error.patch
 Patch0003:     0003-Fix-crit-x-UnicodeDecodeError.patch
+Patch0004:     0004-kerndat-detect-if-system-support-clone3-with-set_tid.patch
+Patch0005:     0005-Add-assembler-wrapper-for-clone3.patch
+Patch0006:     0006-Use-clone3-with-set_tid-to-create-processes.patch
+Patch0007:     0007-clone3-handle-clone3-with-CLONE_PARENT.patch
+Patch0008:     0008-aarch64-use-clone3-if-possible.patch
+Patch0009:     0009-criu-dump-and-restore-cpu-affinity-of-each-thread.patch
+Patch0010:     0010-vdso-fix-segmentation-fault-caused-by-char-pointer-a.patch
 
 %description
 Checkpoint/Restore in Userspace(CRIU),is a software tool for the linux operating system.
@@ -91,6 +98,11 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*}
 
 %changelog
+* Fri Feb 26 2021 snoweay <snoweay@163.com> - 3.13-8
+- Fix one vdso coredump bug.
+- Use clone3 to specify restoring task pid.
+- Add cpu affinity save support.
+
 * Tue Sep 22 2020 lingsheng <lingsheng@huawei.com> - 3.13-7
 - Fix crit errors
 

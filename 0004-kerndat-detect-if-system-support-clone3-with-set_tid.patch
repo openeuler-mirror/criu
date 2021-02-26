@@ -1,0 +1,241 @@
+From 4f5b57b143d2f92682a0ab14c00df3b2f6f87c05 Mon Sep 17 00:00:00 2001
+From: Adrian Reber <areber@redhat.com>
+Date: Sun, 15 Dec 2019 20:38:46 +0000
+Subject: [PATCH] kerndat: detect if system support clone3() with set_tid
+
+Linux kernel 5.4 extends clone3() with set_tid to allow processes to
+specify the PID of a newly created process. This introduces detection
+of the clone3() syscall and if set_tid is supported.
+
+This first implementation is X86_64 only.
+
+Signed-off-by: Adrian Reber <areber@redhat.com>
+Signed-off-by: Sang Yan <sangyan@huawei.com>
+---
+ compel/arch/arm/plugins/std/syscalls/syscall.def   |  1 +
+ .../ppc64/plugins/std/syscalls/syscall-ppc64.tbl   |  1 +
+ .../s390/plugins/std/syscalls/syscall-s390.tbl     |  1 +
+ .../arch/x86/plugins/std/syscalls/syscall_32.tbl   |  1 +
+ .../arch/x86/plugins/std/syscalls/syscall_64.tbl   |  1 +
+ compel/plugins/include/uapi/std/syscall-types.h    |  1 +
+ criu/cr-check.c                                    | 12 +++++++
+ criu/include/kerndat.h                             |  1 +
+ criu/include/sched.h                               | 33 +++++++++++++++++
+ criu/kerndat.c                                     | 41 ++++++++++++++++++++++
+ 10 files changed, 93 insertions(+)
+ create mode 100644 criu/include/sched.h
+
+diff --git a/compel/arch/arm/plugins/std/syscalls/syscall.def b/compel/arch/arm/plugins/std/syscalls/syscall.def
+index 721ff16..2b93cb0 100644
+--- a/compel/arch/arm/plugins/std/syscalls/syscall.def
++++ b/compel/arch/arm/plugins/std/syscalls/syscall.def
+@@ -112,3 +112,4 @@ userfaultfd			282	388	(int flags)
+ fallocate			47	352	(int fd, int mode, loff_t offset, loff_t len)
+ cacheflush			!	983042	(void *start, void *end, int flags)
+ ppoll				73	336	(struct pollfd *fds, unsigned int nfds, const struct timespec *tmo, const sigset_t *sigmask, size_t sigsetsize)
++clone3				435	435	(struct clone_args *uargs, size_t size)
+diff --git a/compel/arch/ppc64/plugins/std/syscalls/syscall-ppc64.tbl b/compel/arch/ppc64/plugins/std/syscalls/syscall-ppc64.tbl
+index 3b30790..7cdf136 100644
+--- a/compel/arch/ppc64/plugins/std/syscalls/syscall-ppc64.tbl
++++ b/compel/arch/ppc64/plugins/std/syscalls/syscall-ppc64.tbl
+@@ -108,3 +108,4 @@ __NR_gettimeofday	78		sys_gettimeofday	(struct timeval *tv, struct timezone *tz)
+ __NR_preadv		320		sys_preadv_raw		(int fd, struct iovec *iov, unsigned long nr, unsigned long pos_l, unsigned long pos_h)
+ __NR_userfaultfd	364		sys_userfaultfd		(int flags)
+ __NR_ppoll		281		sys_ppoll		(struct pollfd *fds, unsigned int nfds, const struct timespec *tmo, const sigset_t *sigmask, size_t sigsetsize)
++__NR_clone3		435		sys_clone3		(struct clone_args *uargs, size_t size)
+diff --git a/compel/arch/s390/plugins/std/syscalls/syscall-s390.tbl b/compel/arch/s390/plugins/std/syscalls/syscall-s390.tbl
+index cc13a63..5cf2284 100644
+--- a/compel/arch/s390/plugins/std/syscalls/syscall-s390.tbl
++++ b/compel/arch/s390/plugins/std/syscalls/syscall-s390.tbl
+@@ -108,3 +108,4 @@ __NR_userfaultfd	355		sys_userfaultfd		(int flags)
+ __NR_preadv		328		sys_preadv_raw		(int fd, struct iovec *iov, unsigned long nr, unsigned long pos_l, unsigned long pos_h)
+ __NR_gettimeofday	78		sys_gettimeofday	(struct timeval *tv, struct timezone *tz)
+ __NR_ppoll		302		sys_ppoll		(struct pollfd *fds, unsigned int nfds, const struct timespec *tmo, const sigset_t *sigmask, size_t sigsetsize)
++__NR_clone3		435		sys_clone3		(struct clone_args *uargs, size_t size)
+diff --git a/compel/arch/x86/plugins/std/syscalls/syscall_32.tbl b/compel/arch/x86/plugins/std/syscalls/syscall_32.tbl
+index 7903ab1..f1faace 100644
+--- a/compel/arch/x86/plugins/std/syscalls/syscall_32.tbl
++++ b/compel/arch/x86/plugins/std/syscalls/syscall_32.tbl
+@@ -96,3 +96,4 @@ __NR_seccomp		354		sys_seccomp		(unsigned int op, unsigned int flags, const char
+ __NR_memfd_create	356		sys_memfd_create	(const char *name, unsigned int flags)
+ __NR_userfaultfd	374		sys_userfaultfd		(int flags)
+ __NR_ppoll		309		sys_ppoll		(struct pollfd *fds, unsigned int nfds, const struct timespec *tmo, const sigset_t *sigmask, size_t sigsetsize)
++__NR_clone3		435		sys_clone3		(struct clone_args *uargs, size_t size)
+diff --git a/compel/arch/x86/plugins/std/syscalls/syscall_64.tbl b/compel/arch/x86/plugins/std/syscalls/syscall_64.tbl
+index 4ac9164..9056f5e 100644
+--- a/compel/arch/x86/plugins/std/syscalls/syscall_64.tbl
++++ b/compel/arch/x86/plugins/std/syscalls/syscall_64.tbl
+@@ -107,3 +107,4 @@ __NR_kcmp			312		sys_kcmp		(pid_t pid1, pid_t pid2, int type, unsigned long idx1
+ __NR_memfd_create		319		sys_memfd_create	(const char *name, unsigned int flags)
+ __NR_userfaultfd		323		sys_userfaultfd		(int flags)
+ __NR_ppoll			271		sys_ppoll		(struct pollfd *fds, unsigned int nfds, const struct timespec *tmo, const sigset_t *sigmask, size_t sigsetsize)
++__NR_clone3			435		sys_clone3		(struct clone_args *uargs, size_t size)
+diff --git a/compel/plugins/include/uapi/std/syscall-types.h b/compel/plugins/include/uapi/std/syscall-types.h
+index 57865e7..031e773 100644
+--- a/compel/plugins/include/uapi/std/syscall-types.h
++++ b/compel/plugins/include/uapi/std/syscall-types.h
+@@ -39,6 +39,7 @@ struct msghdr;
+ struct rusage;
+ struct iocb;
+ struct pollfd;
++struct clone_args;
+ 
+ typedef unsigned long aio_context_t;
+ 
+diff --git a/criu/cr-check.c b/criu/cr-check.c
+index 75a665c..30d6fdc 100644
+--- a/criu/cr-check.c
++++ b/criu/cr-check.c
+@@ -1224,6 +1224,16 @@ static int check_uffd_noncoop(void)
+ 	return 0;
+ }
+ 
++static int check_clone3_set_tid(void)
++{
++	if (!kdat.has_clone3_set_tid) {
++		pr_warn("clone3() with set_tid not supported\n");
++		return -1;
++	}
++
++	return 0;
++}
++
+ static int check_can_map_vdso(void)
+ {
+ 	if (kdat_can_map_vdso() == 1)
+@@ -1373,6 +1383,7 @@ int cr_check(void)
+ 		ret |= check_sk_netns();
+ 		ret |= check_kcmp_epoll();
+ 		ret |= check_net_diag_raw();
++		ret |= check_clone3_set_tid();
+ 	}
+ 
+ 	/*
+@@ -1476,6 +1487,7 @@ static struct feature_list feature_list[] = {
+ 	{ "link_nsid", check_link_nsid},
+ 	{ "kcmp_epoll", check_kcmp_epoll},
+ 	{ "external_net_ns", check_external_net_ns},
++	{ "clone3_set_tid", check_clone3_set_tid},
+ 	{ NULL, NULL },
+ };
+ 
+diff --git a/criu/include/kerndat.h b/criu/include/kerndat.h
+index d93e078..5e78508 100644
+--- a/criu/include/kerndat.h
++++ b/criu/include/kerndat.h
+@@ -65,6 +65,7 @@ struct kerndat_s {
+ 	bool x86_has_ptrace_fpu_xsave_bug;
+ 	bool has_inotify_setnextwd;
+ 	bool has_kcmp_epoll_tfd;
++	bool has_clone3_set_tid;
+ };
+ 
+ extern struct kerndat_s kdat;
+diff --git a/criu/include/sched.h b/criu/include/sched.h
+new file mode 100644
+index 0000000..78f65e3
+--- /dev/null
++++ b/criu/include/sched.h
+@@ -0,0 +1,33 @@
++#ifndef __CR_SCHED_H__
++#define __CR_SCHED_H__
++
++#include <linux/types.h>
++
++#ifndef ptr_to_u64
++#define ptr_to_u64(ptr)	((__u64)((uintptr_t)(ptr)))
++#endif
++#ifndef u64_to_ptr
++#define u64_to_ptr(x)	((void *)(uintptr_t)x)
++#endif
++
++/*
++ * This structure is needed by clone3(). The kernel
++ * calls it 'struct clone_args'. As CRIU will always
++ * need at least this part of the structure (VER1)
++ * to be able to test if clone3() with set_tid works,
++ * the structure is defined here as 'struct _clone_args'.
++ */
++
++struct _clone_args {
++	__aligned_u64 flags;
++	__aligned_u64 pidfd;
++	__aligned_u64 child_tid;
++	__aligned_u64 parent_tid;
++	__aligned_u64 exit_signal;
++	__aligned_u64 stack;
++	__aligned_u64 stack_size;
++	__aligned_u64 tls;
++	__aligned_u64 set_tid;
++	__aligned_u64 set_tid_size;
++};
++#endif /* __CR_SCHED_H__ */
+diff --git a/criu/kerndat.c b/criu/kerndat.c
+index 39cacb8..a13adbc 100644
+--- a/criu/kerndat.c
++++ b/criu/kerndat.c
+@@ -41,6 +41,7 @@
+ #include "uffd.h"
+ #include "vdso.h"
+ #include "kcmp.h"
++#include "sched.h"
+ 
+ struct kerndat_s kdat = {
+ };
+@@ -972,6 +973,44 @@ static int kerndat_tun_netns(void)
+ 	return check_tun_netns_cr(&kdat.tun_ns);
+ }
+ 
++static bool kerndat_has_clone3_set_tid(void)
++{
++	pid_t pid;
++	struct _clone_args args = {};
++
++#ifndef CONFIG_X86_64
++	/*
++	 * Currently the CRIU PIE assembler clone3() wrapper is
++	 * only implemented for X86_64.
++	 */
++	kdat.has_clone3_set_tid = false;
++	return 0;
++#endif
++
++	args.set_tid = -1;
++	/*
++	 * On a system without clone3() this will return ENOSYS.
++	 * On a system with clone3() but without set_tid this
++	 * will return E2BIG.
++	 * On a system with clone3() and set_tid it will return
++	 * EINVAL.
++	 */
++	pid = syscall(__NR_clone3, &args, sizeof(args));
++
++	if (pid == -1 && (errno == ENOSYS || errno == E2BIG)) {
++		kdat.has_clone3_set_tid = false;
++		return 0;
++	}
++	if (pid == -1 && errno == EINVAL) {
++		kdat.has_clone3_set_tid = true;
++	} else {
++		pr_perror("Unexpected error from clone3\n");
++		return -1;
++	}
++
++	return 0;
++}
++
+ int kerndat_init(void)
+ {
+ 	int ret;
+@@ -1043,6 +1082,8 @@ int kerndat_init(void)
+ 		ret = kerndat_has_inotify_setnextwd();
+ 	if (!ret)
+ 		ret = has_kcmp_epoll_tfd();
++	if (!ret)
++		ret = kerndat_has_clone3_set_tid();
+ 
+ 	kerndat_lsm();
+ 	kerndat_mmap_min_addr();
+-- 
+2.9.5
+

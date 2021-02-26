@@ -1,0 +1,43 @@
+From 4b547f723a3fdc60c2b68ed0141b150b94d54c8c Mon Sep 17 00:00:00 2001
+From: Adrian Reber <areber@redhat.com>
+Date: Sat, 25 Jan 2020 13:25:21 +0100
+Subject: [PATCH] clone3: handle clone3() with CLONE_PARENT
+
+clone3() explicitly blocks setting an exit_signal if CLONE_PARENT is
+specified. With clone() it also did not work, but there was no error
+message. The exit signal from the thread group leader is taken.
+
+Signed-off-by: Adrian Reber <areber@redhat.com>
+Signed-off-by: Sang Yan <sangyan@huawei.com>
+---
+ criu/clone-noasan.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/criu/clone-noasan.c b/criu/clone-noasan.c
+index 2784d12..7485a52 100644
+--- a/criu/clone-noasan.c
++++ b/criu/clone-noasan.c
+@@ -52,7 +52,19 @@ int clone3_with_pid_noasan(int (*fn)(void *), void *arg, int flags,
+ 
+ 	pr_debug("Creating process using clone3()\n");
+ 
+-	c_args.exit_signal = exit_signal;
++	/*
++	 * clone3() explicitly blocks setting an exit_signal
++	 * if CLONE_PARENT is specified. With clone() it also
++	 * did not work, but there was no error message. The
++	 * exit signal from the thread group leader is taken.
++	 */
++	if (!(flags & CLONE_PARENT)) {
++		if (exit_signal != SIGCHLD) {
++			pr_err("Exit signal not SIGCHLD\n");
++			return -1;
++		}
++		c_args.exit_signal = exit_signal;
++	}
+ 	c_args.flags = flags;
+ 	c_args.set_tid = ptr_to_u64(&pid);
+ 	c_args.set_tid_size = 1;
+-- 
+2.9.5
+
