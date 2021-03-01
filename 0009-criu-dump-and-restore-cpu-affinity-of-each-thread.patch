@@ -1,0 +1,417 @@
+From baa12b00eeb88bee4de11e28df623662a2b32078 Mon Sep 17 00:00:00 2001
+From: Sang Yan <sangyan@huawei.com>
+Date: Thu, 26 Nov 2020 21:18:54 +0800
+Subject: [PATCH] criu: dump and restore cpu affinity of each thread
+
+Criu should dump and restore threads' or processes'
+cpu affinity.
+
+Add one entry of thread_cpuallow_entry into
+thread_core_entry to save cpu affinity info.
+
+Restore it after threads restored but before running.
+
+Add option --with-cpu-affinity to enable this function
+at restore.
+
+Signed-off-by: Sang Yan <sangyan@huawei.com>
+---
+ compel/arch/arm/plugins/std/syscalls/syscall.def   |  1 +
+ .../ppc64/plugins/std/syscalls/syscall-ppc64.tbl   |  1 +
+ .../s390/plugins/std/syscalls/syscall-s390.tbl     |  1 +
+ .../arch/x86/plugins/std/syscalls/syscall_32.tbl   |  1 +
+ .../arch/x86/plugins/std/syscalls/syscall_64.tbl   |  1 +
+ criu/config.c                                      |  1 +
+ criu/cr-dump.c                                     | 14 ++++++++
+ criu/cr-restore.c                                  | 26 ++++++++++++++
+ criu/crtools.c                                     |  2 ++
+ criu/include/cr_options.h                          |  1 +
+ criu/include/restorer.h                            |  3 ++
+ criu/pie/restorer.c                                | 38 ++++++++++++++++++++
+ criu/pstree.c                                      |  7 ++++
+ images/core.proto                                  |  5 +++
+ test/zdtm/static/Makefile                          |  1 +
+ test/zdtm/static/cpu-affinity0.c                   | 42 ++++++++++++++++++++++
+ test/zdtm/static/cpu-affinity0.desc                |  1 +
+ 17 files changed, 146 insertions(+)
+ create mode 100644 test/zdtm/static/cpu-affinity0.c
+ create mode 100644 test/zdtm/static/cpu-affinity0.desc
+
+diff --git a/compel/arch/arm/plugins/std/syscalls/syscall.def b/compel/arch/arm/plugins/std/syscalls/syscall.def
+index 2b93cb0..eaea589 100644
+--- a/compel/arch/arm/plugins/std/syscalls/syscall.def
++++ b/compel/arch/arm/plugins/std/syscalls/syscall.def
+@@ -113,3 +113,4 @@ fallocate			47	352	(int fd, int mode, loff_t offset, loff_t len)
+ cacheflush			!	983042	(void *start, void *end, int flags)
+ ppoll				73	336	(struct pollfd *fds, unsigned int nfds, const struct timespec *tmo, const sigset_t *sigmask, size_t sigsetsize)
+ clone3				435	435	(struct clone_args *uargs, size_t size)
++sched_setaffinity		122	241	(int fd, size_t cpusetsize, const cpu_set_t *mask)
+diff --git a/compel/arch/ppc64/plugins/std/syscalls/syscall-ppc64.tbl b/compel/arch/ppc64/plugins/std/syscalls/syscall-ppc64.tbl
+index 7cdf136..3c7497e 100644
+--- a/compel/arch/ppc64/plugins/std/syscalls/syscall-ppc64.tbl
++++ b/compel/arch/ppc64/plugins/std/syscalls/syscall-ppc64.tbl
+@@ -109,3 +109,4 @@ __NR_preadv		320		sys_preadv_raw		(int fd, struct iovec *iov, unsigned long nr,
+ __NR_userfaultfd	364		sys_userfaultfd		(int flags)
+ __NR_ppoll		281		sys_ppoll		(struct pollfd *fds, unsigned int nfds, const struct timespec *tmo, const sigset_t *sigmask, size_t sigsetsize)
+ __NR_clone3		435		sys_clone3		(struct clone_args *uargs, size_t size)
++__NR_sched_setaffinity	222		sys_sched_setaffinity	(int fd, size_t cpusetsize, const cpu_set_t *mask)
+diff --git a/compel/arch/s390/plugins/std/syscalls/syscall-s390.tbl b/compel/arch/s390/plugins/std/syscalls/syscall-s390.tbl
+index 5cf2284..cf13120 100644
+--- a/compel/arch/s390/plugins/std/syscalls/syscall-s390.tbl
++++ b/compel/arch/s390/plugins/std/syscalls/syscall-s390.tbl
+@@ -109,3 +109,4 @@ __NR_preadv		328		sys_preadv_raw		(int fd, struct iovec *iov, unsigned long nr,
+ __NR_gettimeofday	78		sys_gettimeofday	(struct timeval *tv, struct timezone *tz)
+ __NR_ppoll		302		sys_ppoll		(struct pollfd *fds, unsigned int nfds, const struct timespec *tmo, const sigset_t *sigmask, size_t sigsetsize)
+ __NR_clone3		435		sys_clone3		(struct clone_args *uargs, size_t size)
++__NR_sched_setaffinity	239		sys_sched_setaffinity	(int fd, size_t cpusetsize, const cpu_set_t *mask)
+diff --git a/compel/arch/x86/plugins/std/syscalls/syscall_32.tbl b/compel/arch/x86/plugins/std/syscalls/syscall_32.tbl
+index f1faace..20f76f2 100644
+--- a/compel/arch/x86/plugins/std/syscalls/syscall_32.tbl
++++ b/compel/arch/x86/plugins/std/syscalls/syscall_32.tbl
+@@ -63,6 +63,7 @@ __NR_mincore		218		sys_mincore		(void *addr, unsigned long size, unsigned char *
+ __NR_madvise		219		sys_madvise		(unsigned long start, size_t len, int behavior)
+ __NR_gettid		224		sys_gettid		(void)
+ __NR_futex		240		sys_futex		(uint32_t *uaddr, int op, uint32_t val, struct timespec *utime, uint32_t *uaddr2, uint32_t val3)
++__NR_sched_setaffinity	241		sys_sched_setaffinity	(int fd, size_t cpusetsize, const cpu_set_t *mask)
+ __NR_set_thread_area	243		sys_set_thread_area	(user_desc_t *info)
+ __NR_get_thread_area	244		sys_get_thread_area	(user_desc_t *info)
+ __NR_io_setup		245		sys_io_setup		(unsigned nr_reqs, aio_context_t *ctx32p)
+diff --git a/compel/arch/x86/plugins/std/syscalls/syscall_64.tbl b/compel/arch/x86/plugins/std/syscalls/syscall_64.tbl
+index 9056f5e..38e384d 100644
+--- a/compel/arch/x86/plugins/std/syscalls/syscall_64.tbl
++++ b/compel/arch/x86/plugins/std/syscalls/syscall_64.tbl
+@@ -73,6 +73,7 @@ __NR_mount			165		sys_mount		(char *dev_nmae, char *dir_name, char *type, unsign
+ __NR_umount2			166		sys_umount2		(char *name, int flags)
+ __NR_gettid			186		sys_gettid		(void)
+ __NR_futex			202		sys_futex		(uint32_t *uaddr, int op, uint32_t val, struct timespec *utime, uint32_t *uaddr2, uint32_t val3)
++__NR_sched_setaffinity		203		sys_sched_setaffinity	(int fd, size_t cpusetsize, const cpu_set_t *mask)
+ __NR_set_thread_area		205		sys_set_thread_area	(user_desc_t *info)
+ __NR_io_setup			206		sys_io_setup		(unsigned nr_events, aio_context_t *ctx)
+ __NR_io_getevents		208		sys_io_getevents	(aio_context_t ctx, long min_nr, long nr, struct io_event *evs, struct timespec *tmo)
+diff --git a/criu/config.c b/criu/config.c
+index 39aa071..76d6e5f 100644
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -516,6 +516,7 @@ int parse_options(int argc, char **argv, bool *usage_error,
+ 		{ "tls-key",			required_argument,	0, 1095},
+ 		BOOL_OPT("tls", &opts.tls),
+ 		{"tls-no-cn-verify",		no_argument,		&opts.tls_no_cn_verify, true},
++		BOOL_OPT("with-cpu-affinity", &opts.with_cpu_affinity),
+ 		{ },
+ 	};
+ 
+diff --git a/criu/cr-dump.c b/criu/cr-dump.c
+index 9273fc0..0d67073 100644
+--- a/criu/cr-dump.c
++++ b/criu/cr-dump.c
+@@ -137,6 +137,7 @@ static int dump_sched_info(int pid, ThreadCoreEntry *tc)
+ {
+ 	int ret;
+ 	struct sched_param sp;
++	cpu_set_t cpumask;
+ 
+ 	BUILD_BUG_ON(SCHED_OTHER != 0); /* default in proto message */
+ 
+@@ -182,6 +183,19 @@ static int dump_sched_info(int pid, ThreadCoreEntry *tc)
+ 	tc->has_sched_nice = true;
+ 	tc->sched_nice = ret;
+ 
++	pr_info("\tdumping allowed cpus for %d\n", pid);
++	ret = syscall(__NR_sched_getaffinity, pid, sizeof(cpumask), &cpumask);
++	if (ret < 0) {
++		pr_perror("Can't get sched affinity for %d", pid);
++		return -1;
++	}
++	memcpy(tc->allowed_cpus->cpumask, &cpumask, sizeof(cpu_set_t));
++	pr_info("\t 0x%llx, 0x%llx, 0x%llx, 0x%llx\n",
++		(unsigned long long)tc->allowed_cpus->cpumask[3],
++		(unsigned long long)tc->allowed_cpus->cpumask[2],
++		(unsigned long long)tc->allowed_cpus->cpumask[1],
++		(unsigned long long)tc->allowed_cpus->cpumask[0]);
++
+ 	return 0;
+ }
+ 
+diff --git a/criu/cr-restore.c b/criu/cr-restore.c
+index 92856ed..c2be323 100644
+--- a/criu/cr-restore.c
++++ b/criu/cr-restore.c
+@@ -114,6 +114,7 @@ static int prepare_restorer_blob(void);
+ static int prepare_rlimits(int pid, struct task_restore_args *, CoreEntry *core);
+ static int prepare_posix_timers(int pid, struct task_restore_args *ta, CoreEntry *core);
+ static int prepare_signals(int pid, struct task_restore_args *, CoreEntry *core);
++static int prepare_allowed_cpus(int pid, struct task_restore_args *ta, CoreEntry *leader_core);
+ 
+ /*
+  * Architectures can overwrite this function to restore registers that are not
+@@ -902,6 +903,9 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
+ 	if (prepare_signals(pid, ta, core))
+ 		return -1;
+ 
++	if (prepare_allowed_cpus(pid, ta, core))
++		return -1;
++
+ 	if (prepare_posix_timers(pid, ta, core))
+ 		return -1;
+ 
+@@ -3037,6 +3041,27 @@ out:
+ 	return ret;
+ }
+ 
++static int prepare_allowed_cpus(int pid, struct task_restore_args *ta, CoreEntry *leader_core)
++{
++	int i;
++	int *need_cpu_affinity;
++	cpu_set_t *cpumaks;
++
++	ta->allowed_cpus = (char *)rst_mem_align_cpos(RM_PRIVATE);
++
++	need_cpu_affinity = rst_mem_alloc(sizeof(int), RM_PRIVATE);
++	*need_cpu_affinity = opts.with_cpu_affinity;
++
++	for (i = 0; i < current->nr_threads; i++) {
++		cpumaks = rst_mem_alloc(sizeof(cpu_set_t), RM_PRIVATE);
++		if (!cpumaks)
++			return -1;
++
++		memcpy(cpumaks, current->core[i]->thread_core->allowed_cpus->cpumask, sizeof(cpu_set_t));
++	}
++	return 0;
++}
++
+ extern void __gcov_flush(void) __attribute__((weak));
+ void __gcov_flush(void) {}
+ 
+@@ -3459,6 +3484,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
+ 	RST_MEM_FIXUP_PPTR(task_args->timerfd);
+ 	RST_MEM_FIXUP_PPTR(task_args->posix_timers);
+ 	RST_MEM_FIXUP_PPTR(task_args->siginfo);
++	RST_MEM_FIXUP_PPTR(task_args->allowed_cpus);
+ 	RST_MEM_FIXUP_PPTR(task_args->rlims);
+ 	RST_MEM_FIXUP_PPTR(task_args->helpers);
+ 	RST_MEM_FIXUP_PPTR(task_args->zombies);
+diff --git a/criu/crtools.c b/criu/crtools.c
+index a948756..a22664d 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -388,6 +388,8 @@ usage:
+ "			Namespace can be specified as either pid or file path.\n"
+ "			OPTIONS can be used to specify parameters for userns:\n"
+ "			    user:PID,UID,GID\n"
++"  --with-cpu-affinity	Allow to restore cpu affinity. Only for hosts with\n"
++"			same cpu quantity.\n"
+ "\n"
+ "Check options:\n"
+ "  Without options, \"criu check\" checks availability of absolutely required\n"
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index 82f76ad..98c5a44 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -144,6 +144,7 @@ struct cr_options {
+ 	char			*tls_key;
+ 	int			tls;
+ 	int			tls_no_cn_verify;
++	int			with_cpu_affinity;	/* restore cpu affinity */
+ };
+ 
+ extern struct cr_options opts;
+diff --git a/criu/include/restorer.h b/criu/include/restorer.h
+index dfb4e6b..bd6ef6a 100644
+--- a/criu/include/restorer.h
++++ b/criu/include/restorer.h
+@@ -1,6 +1,7 @@
+ #ifndef __CR_RESTORER_H__
+ #define __CR_RESTORER_H__
+ 
++#include <sched.h>
+ #include <signal.h>
+ #include <limits.h>
+ #include <sys/resource.h>
+@@ -162,6 +163,8 @@ struct task_restore_args {
+ 	siginfo_t			*siginfo;
+ 	unsigned int			siginfo_n;
+ 
++	char				*allowed_cpus;
++
+ 	struct rst_tcp_sock		*tcp_socks;
+ 	unsigned int			tcp_socks_n;
+ 
+diff --git a/criu/pie/restorer.c b/criu/pie/restorer.c
+index 8bdc88a..571341d 100644
+--- a/criu/pie/restorer.c
++++ b/criu/pie/restorer.c
+@@ -432,6 +432,40 @@ static int restore_signals(siginfo_t *ptr, int nr, bool group)
+ 	return 0;
+ }
+ 
++static int restore_cpu_affinity(struct task_restore_args *args)
++{
++	int i;
++	int pid;
++	int ret;
++	int *need_cpu_affinity;
++	cpu_set_t *cpumask;
++	cpu_set_t *allowed_cpus;
++
++	need_cpu_affinity = (int *)args->allowed_cpus;
++	if (!*need_cpu_affinity) {
++		pr_debug("No need to restore cpu affinity.\n");
++		return 0;
++	}
++
++	allowed_cpus = (cpu_set_t *)(args->allowed_cpus + sizeof(int));
++	for (i = 0; i < args->nr_threads; i++) {
++		pid = args->thread_args[i].pid;
++		cpumask = &allowed_cpus[i];
++		pr_info("Restoring %d allowed_cpus %llx, %llx, %llx, %llx\n", pid,
++			(unsigned long long)cpumask->__bits[3],
++			(unsigned long long)cpumask->__bits[2],
++			(unsigned long long)cpumask->__bits[1],
++			(unsigned long long)cpumask->__bits[0]);
++		ret = sys_sched_setaffinity(pid, sizeof(cpu_set_t), cpumask);
++		if (ret) {
++			pr_err("\t Restore %d cpumask failed.\n", pid);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
+ static int restore_seccomp_filter(pid_t tid, struct thread_restore_args *args)
+ {
+ 	unsigned int flags = args->seccomp_force_tsync ? SECCOMP_FILTER_FLAG_TSYNC : 0;
+@@ -1897,6 +1931,10 @@ long __export_restore_task(struct task_restore_args *args)
+ 	if (ret)
+ 		goto core_restore_end;
+ 
++	ret = restore_cpu_affinity(args);
++	if (ret)
++		goto core_restore_end;
++
+ 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD);
+ 
+ 	rst_tcp_socks_all(args);
+diff --git a/criu/pstree.c b/criu/pstree.c
+index 92b4167..203ce21 100644
+--- a/criu/pstree.c
++++ b/criu/pstree.c
+@@ -58,11 +58,13 @@ CoreEntry *core_entry_alloc(int th, int tsk)
+ 		CredsEntry *ce = NULL;
+ 
+ 		sz += sizeof(ThreadCoreEntry) + sizeof(ThreadSasEntry) + sizeof(CredsEntry);
++		sz += sizeof(ThreadAllowedcpusEntry);
+ 
+ 		sz += CR_CAP_SIZE * sizeof(ce->cap_inh[0]);
+ 		sz += CR_CAP_SIZE * sizeof(ce->cap_prm[0]);
+ 		sz += CR_CAP_SIZE * sizeof(ce->cap_eff[0]);
+ 		sz += CR_CAP_SIZE * sizeof(ce->cap_bnd[0]);
++		sz += sizeof(cpu_set_t);
+ 		/*
+ 		 * @groups are dynamic and allocated
+ 		 * on demand.
+@@ -127,6 +129,11 @@ CoreEntry *core_entry_alloc(int th, int tsk)
+ 			ce->cap_eff	= xptr_pull_s(&m, CR_CAP_SIZE * sizeof(ce->cap_eff[0]));
+ 			ce->cap_bnd	= xptr_pull_s(&m, CR_CAP_SIZE * sizeof(ce->cap_bnd[0]));
+ 
++			core->thread_core->allowed_cpus = xptr_pull(&m, ThreadAllowedcpusEntry);
++			thread_allowedcpus_entry__init(core->thread_core->allowed_cpus);
++			core->thread_core->allowed_cpus->n_cpumask = sizeof(cpu_set_t) / sizeof(uint64_t);
++			core->thread_core->allowed_cpus->cpumask = xptr_pull_s(&m, sizeof(cpu_set_t));
++
+ 			if (arch_alloc_thread_info(core)) {
+ 				xfree(core);
+ 				core = NULL;
+diff --git a/images/core.proto b/images/core.proto
+index c3dba6f..535881f 100644
+--- a/images/core.proto
++++ b/images/core.proto
+@@ -76,6 +76,10 @@ message thread_sas_entry {
+ 	required uint32			ss_flags	= 3;
+ }
+ 
++message thread_allowedcpus_entry {
++	repeated uint64			cpumask		= 1;
++}
++
+ message thread_core_entry {
+ 	required uint64			futex_rla	= 1;
+ 	required uint32			futex_rla_len	= 2;
+@@ -93,6 +97,7 @@ message thread_core_entry {
+ 	optional uint32			seccomp_filter	= 12;
+ 
+ 	optional string			comm		= 13;
++	required thread_allowedcpus_entry	allowed_cpus	= 15;
+ }
+ 
+ message task_rlimits_entry {
+diff --git a/test/zdtm/static/Makefile b/test/zdtm/static/Makefile
+index d8279d6..8ac3442 100644
+--- a/test/zdtm/static/Makefile
++++ b/test/zdtm/static/Makefile
+@@ -217,6 +217,7 @@ TST_NOFILE	:=				\
+ 		child_subreaper			\
+ 		child_subreaper_existing_child	\
+ 		child_subreaper_and_reparent	\
++		cpu-affinity0			\
+ #		jobctl00			\
+ 
+ ifneq ($(SRCARCH),arm)
+diff --git a/test/zdtm/static/cpu-affinity0.c b/test/zdtm/static/cpu-affinity0.c
+new file mode 100644
+index 0000000..83dee19
+--- /dev/null
++++ b/test/zdtm/static/cpu-affinity0.c
+@@ -0,0 +1,42 @@
++#include <errno.h>
++#include <stdlib.h>
++#include <sched.h>
++
++#include "zdtmtst.h"
++
++const char *test_doc	= "Check that with-cpu-affinity option can restore cpu affinity";
++const char *test_author	= "Sang Yan <sangyan@huawei.com>";
++
++int main(int argc, char **argv)
++{
++	cpu_set_t old;
++	cpu_set_t new;
++
++	test_init(argc, argv);
++
++	CPU_ZERO(&old);
++	CPU_ZERO(&new);
++
++	/* test only 0 core because of CI test env limited */
++	CPU_SET(0, &old);
++
++	if (sched_setaffinity(getpid(), sizeof(old), &old) < 0) {
++		pr_perror("Can't set old cpu affinity! errno: %d", errno);
++		exit(1);
++	}
++
++	test_daemon();
++	test_waitsig();
++
++	if (sched_getaffinity(getpid(), sizeof(new), &new) < 0) {
++		pr_perror("Can't get new cpu affinity! errno: %d", errno);
++		exit(1);
++	}
++
++	if (memcmp(&old, &new, sizeof(cpu_set_t)))
++		fail("Cpu affinity restore failed.");
++	else
++		pass();
++
++	return 0;
++}
+diff --git a/test/zdtm/static/cpu-affinity0.desc b/test/zdtm/static/cpu-affinity0.desc
+new file mode 100644
+index 0000000..0d0b8ae
+--- /dev/null
++++ b/test/zdtm/static/cpu-affinity0.desc
+@@ -0,0 +1 @@
++{'dopts': '', 'ropts': '--with-cpu-affinity', 'flags': 'reqrst '}
+-- 
+2.9.5
+

@@ -1,0 +1,307 @@
+From eb742711bb08d11f670204492a0d0fc165f89d0b Mon Sep 17 00:00:00 2001
+From: Adrian Reber <areber@redhat.com>
+Date: Mon, 16 Dec 2019 10:42:13 +0000
+Subject: [PATCH] Use clone3() with set_tid to create processes
+
+With the in Linux Kernel 5.4 introduced clone3() with set_tid it is no
+longer necessary to write to to /proc/../ns_last_pid to influence the
+next PID number. clone3() can directly select a PID for the newly
+created process/thread.
+
+After checking for the availability of clone3() with set_tid and adding
+the assembler wrapper for clone3() in previous patches, this extends
+criu/pie/restorer.c and criu/clone-noasan.c to use the newly added
+assembler clone3() wrapper to create processes with a certain PID.
+
+This is a RFC and WIP, but I wanted to share it and run it through CI
+for feedback. As the CI will probably not use a 5.4 based kernel it
+should just keep on working as before.
+
+Signed-off-by: Adrian Reber <areber@redhat.com>
+Signed-off-by: Sang Yan <sangyan@huawei.com>
+---
+ criu/clone-noasan.c         | 32 +++++++++++++++++++++++
+ criu/cr-restore.c           | 64 ++++++++++++++++++++++++++++-----------------
+ criu/include/clone-noasan.h |  2 ++
+ criu/include/restorer.h     |  1 +
+ criu/include/rst_info.h     |  1 +
+ criu/pie/restorer.c         | 64 +++++++++++++++++++++++++++++----------------
+ 6 files changed, 117 insertions(+), 47 deletions(-)
+
+diff --git a/criu/clone-noasan.c b/criu/clone-noasan.c
+index 5ca280e..2784d12 100644
+--- a/criu/clone-noasan.c
++++ b/criu/clone-noasan.c
+@@ -1,4 +1,10 @@
++#include <stdlib.h>
+ #include <sched.h>
++#include <unistd.h>
++
++#include <compel/plugins/std/syscall-codes.h>
++
++#include "sched.h"
+ #include "common/compiler.h"
+ #include "log.h"
+ #include "common/bug.h"
+@@ -22,6 +28,7 @@
+ int clone_noasan(int (*fn)(void *), int flags, void *arg)
+ {
+ 	void *stack_ptr = (void *)round_down((unsigned long)&stack_ptr - 1024, 16);
++
+ 	BUG_ON((flags & CLONE_VM) && !(flags & CLONE_VFORK));
+ 	/*
+ 	 * Reserve some bytes for clone() internal needs
+@@ -29,3 +36,28 @@ int clone_noasan(int (*fn)(void *), int flags, void *arg)
+ 	 */
+ 	return clone(fn, stack_ptr, flags, arg);
+ }
++
++int clone3_with_pid_noasan(int (*fn)(void *), void *arg, int flags,
++			   int exit_signal, pid_t pid)
++{
++	struct _clone_args c_args = {};
++
++	BUG_ON(flags & CLONE_VM);
++
++	/*
++	 * Make sure no child signals are requested. clone3() uses
++	 * exit_signal for that.
++	 */
++	BUG_ON(flags & 0xff);
++
++	pr_debug("Creating process using clone3()\n");
++
++	c_args.exit_signal = exit_signal;
++	c_args.flags = flags;
++	c_args.set_tid = ptr_to_u64(&pid);
++	c_args.set_tid_size = 1;
++	pid = syscall(__NR_clone3, &c_args, sizeof(c_args));
++	if (pid == 0)
++		exit(fn(arg));
++	return pid;
++}
+diff --git a/criu/cr-restore.c b/criu/cr-restore.c
+index b4530f8..92856ed 100644
+--- a/criu/cr-restore.c
++++ b/criu/cr-restore.c
+@@ -1372,40 +1372,55 @@ static inline int fork_with_pid(struct pstree_item *item)
+ 	if (!(ca.clone_flags & CLONE_NEWPID)) {
+ 		char buf[32];
+ 		int len;
+-		int fd;
++		int fd = -1;
+ 
+-		fd = open_proc_rw(PROC_GEN, LAST_PID_PATH);
+-		if (fd < 0)
+-			goto err;
++		if (!kdat.has_clone3_set_tid) {
++			fd = open_proc_rw(PROC_GEN, LAST_PID_PATH);
++			if (fd < 0)
++				goto err;
++		}
+ 
+ 		lock_last_pid();
+ 
+-		len = snprintf(buf, sizeof(buf), "%d", pid - 1);
+-		if (write(fd, buf, len) != len) {
+-			pr_perror("%d: Write %s to %s", pid, buf, LAST_PID_PATH);
++		if (!kdat.has_clone3_set_tid) {
++			len = snprintf(buf, sizeof(buf), "%d", pid - 1);
++			if (write(fd, buf, len) != len) {
++				pr_perror("%d: Write %s to %s", pid, buf,
++					LAST_PID_PATH);
++				close(fd);
++				goto err_unlock;
++			}
+ 			close(fd);
+-			goto err_unlock;
+ 		}
+-		close(fd);
+ 	} else {
+ 		BUG_ON(pid != INIT_PID);
+ 	}
+ 
+-	/*
+-	 * Some kernel modules, such as network packet generator
+-	 * run kernel thread upon net-namespace creattion taking
+-	 * the @pid we've been requeting via LAST_PID_PATH interface
+-	 * so that we can't restore a take with pid needed.
+-	 *
+-	 * Here is an idea -- unhare net namespace in callee instead.
+-	 */
+-	/*
+-	 * The cgroup namespace is also unshared explicitly in the
+-	 * move_in_cgroup(), so drop this flag here as well.
+-	 */
+-	close_pid_proc();
+-	ret = clone_noasan(restore_task_with_children,
+-			(ca.clone_flags & ~(CLONE_NEWNET | CLONE_NEWCGROUP)) | SIGCHLD, &ca);
++	if (kdat.has_clone3_set_tid) {
++		ret = clone3_with_pid_noasan(restore_task_with_children,
++				&ca, (ca.clone_flags &
++					~(CLONE_NEWNET | CLONE_NEWCGROUP)),
++				SIGCHLD, pid);
++	} else {
++		/*
++		 * Some kernel modules, such as network packet generator
++		 * run kernel thread upon net-namespace creation taking
++		 * the @pid we've been requesting via LAST_PID_PATH interface
++		 * so that we can't restore a take with pid needed.
++		 *
++		 * Here is an idea -- unshare net namespace in callee instead.
++		 */
++		/*
++		 * The cgroup namespace is also unshared explicitly in the
++		 * move_in_cgroup(), so drop this flag here as well.
++		 */
++		close_pid_proc();
++		ret = clone_noasan(restore_task_with_children,
++				(ca.clone_flags &
++				 ~(CLONE_NEWNET | CLONE_NEWCGROUP)) | SIGCHLD,
++				&ca);
++	}
++
+ 	if (ret < 0) {
+ 		pr_perror("Can't fork for %d", pid);
+ 		goto err_unlock;
+@@ -3557,6 +3572,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
+ 	task_args->vdso_maps_rt = vdso_maps_rt;
+ 	task_args->vdso_rt_size = vdso_rt_size;
+ 	task_args->can_map_vdso = kdat.can_map_vdso;
++	task_args->has_clone3_set_tid = kdat.has_clone3_set_tid;
+ 
+ 	new_sp = restorer_stack(task_args->t->mz);
+ 
+diff --git a/criu/include/clone-noasan.h b/criu/include/clone-noasan.h
+index 8ef75fa..0cfdaa1 100644
+--- a/criu/include/clone-noasan.h
++++ b/criu/include/clone-noasan.h
+@@ -2,5 +2,7 @@
+ #define __CR_CLONE_NOASAN_H__
+ 
+ int clone_noasan(int (*fn)(void *), int flags, void *arg);
++int clone3_with_pid_noasan(int (*fn)(void *), void *arg, int flags,
++			   int exit_signal, pid_t pid);
+ 
+ #endif /* __CR_CLONE_NOASAN_H__ */
+diff --git a/criu/include/restorer.h b/criu/include/restorer.h
+index b93807f..dfb4e6b 100644
+--- a/criu/include/restorer.h
++++ b/criu/include/restorer.h
+@@ -221,6 +221,7 @@ struct task_restore_args {
+ #endif
+ 	int				lsm_type;
+ 	int				child_subreaper;
++	bool				has_clone3_set_tid;
+ } __aligned(64);
+ 
+ /*
+diff --git a/criu/include/rst_info.h b/criu/include/rst_info.h
+index 07c634f..3283849 100644
+--- a/criu/include/rst_info.h
++++ b/criu/include/rst_info.h
+@@ -4,6 +4,7 @@
+ #include "common/lock.h"
+ #include "common/list.h"
+ #include "vma.h"
++#include "kerndat.h"
+ 
+ struct task_entries {
+ 	int nr_threads, nr_tasks, nr_helpers;
+diff --git a/criu/pie/restorer.c b/criu/pie/restorer.c
+index 390c0e1..8bdc88a 100644
+--- a/criu/pie/restorer.c
++++ b/criu/pie/restorer.c
+@@ -35,6 +35,7 @@
+ #include "sk-inet.h"
+ #include "vma.h"
+ #include "uffd.h"
++#include "sched.h"
+ 
+ #include "common/lock.h"
+ #include "common/page.h"
+@@ -1769,16 +1770,19 @@ long __export_restore_task(struct task_restore_args *args)
+ 		long clone_flags = CLONE_VM | CLONE_FILES | CLONE_SIGHAND	|
+ 				   CLONE_THREAD | CLONE_SYSVSEM | CLONE_FS;
+ 		long last_pid_len;
++		pid_t thread_pid;
+ 		long parent_tid;
+ 		int i, fd = -1;
+ 
+-		/* One level pid ns hierarhy */
+-		fd = sys_openat(args->proc_fd, LAST_PID_PATH, O_RDWR, 0);
+-		if (fd < 0) {
+-			pr_err("can't open last pid fd %d\n", fd);
+-			goto core_restore_end;
+-		}
++		if (!args->has_clone3_set_tid) {
++			/* One level pid ns hierarhy */
++			fd = sys_openat(args->proc_fd, LAST_PID_PATH, O_RDWR, 0);
++			if (fd < 0) {
++				pr_err("can't open last pid fd %d\n", fd);
++				goto core_restore_end;
++			}
+ 
++		}
+ 		mutex_lock(&task_entries_local->last_pid_mutex);
+ 
+ 		for (i = 0; i < args->nr_threads; i++) {
+@@ -1789,24 +1793,38 @@ long __export_restore_task(struct task_restore_args *args)
+ 				continue;
+ 
+ 			new_sp = restorer_stack(thread_args[i].mz);
+-			last_pid_len = std_vprint_num(last_pid_buf, sizeof(last_pid_buf), thread_args[i].pid - 1, &s);
+-			sys_lseek(fd, 0, SEEK_SET);
+-			ret = sys_write(fd, s, last_pid_len);
+-			if (ret < 0) {
+-				pr_err("Can't set last_pid %ld/%s\n", ret, last_pid_buf);
+-				sys_close(fd);
+-				mutex_unlock(&task_entries_local->last_pid_mutex);
+-				goto core_restore_end;
+-			}
+-
+-			/*
+-			 * To achieve functionality like libc's clone()
+-			 * we need a pure assembly here, because clone()'ed
+-			 * thread will run with own stack and we must not
+-			 * have any additional instructions... oh, dear...
+-			 */
++			if (args->has_clone3_set_tid) {
++				struct _clone_args c_args = {};
++				thread_pid = thread_args[i].pid;
++				c_args.set_tid = ptr_to_u64(&thread_pid);
++				c_args.flags = clone_flags;
++				c_args.set_tid_size = 1;
++				/* The kernel does stack + stack_size. */
++				c_args.stack = new_sp - RESTORE_STACK_SIZE;
++				c_args.stack_size = RESTORE_STACK_SIZE;
++				c_args.child_tid = ptr_to_u64(&thread_args[i].pid);
++				c_args.parent_tid = ptr_to_u64(&parent_tid);
++				pr_debug("Using clone3 to restore the process\n");
++				RUN_CLONE3_RESTORE_FN(ret, c_args, sizeof(c_args), &thread_args[i], args->clone_restore_fn);
++			} else {
++				last_pid_len = std_vprint_num(last_pid_buf, sizeof(last_pid_buf), thread_args[i].pid - 1, &s);
++				sys_lseek(fd, 0, SEEK_SET);
++				ret = sys_write(fd, s, last_pid_len);
++				if (ret < 0) {
++					pr_err("Can't set last_pid %ld/%s\n", ret, last_pid_buf);
++					sys_close(fd);
++					mutex_unlock(&task_entries_local->last_pid_mutex);
++					goto core_restore_end;
++				}
+ 
+-			RUN_CLONE_RESTORE_FN(ret, clone_flags, new_sp, parent_tid, thread_args, args->clone_restore_fn);
++				/*
++				 * To achieve functionality like libc's clone()
++				 * we need a pure assembly here, because clone()'ed
++				 * thread will run with own stack and we must not
++				 * have any additional instructions... oh, dear...
++				 */
++				RUN_CLONE_RESTORE_FN(ret, clone_flags, new_sp, parent_tid, thread_args, args->clone_restore_fn);
++			}
+ 			if (ret != thread_args[i].pid) {
+ 				pr_err("Unable to create a thread: %ld\n", ret);
+ 				mutex_unlock(&task_entries_local->last_pid_mutex);
+-- 
+2.9.5
+
