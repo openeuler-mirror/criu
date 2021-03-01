@@ -1,0 +1,35 @@
+From 3482094d4d62fcca1e90f1762b7862bd9ae95fea Mon Sep 17 00:00:00 2001
+From: Andrei Vagin <avagin@gmail.com>
+Date: Tue, 4 Feb 2020 23:13:43 -0800
+Subject: [PATCH] vdso: use correct offsets to remap vdso and vvar mappings
+
+In the current version, the offsets of remapping vvar and vdso regions
+are mixed up.
+
+If vdso is before vvar, vvar has to be mapped with the vdso_size offset.
+if vvar is before vdso, vdso has to be mapped with the vvar_size offset.
+
+Signed-off-by: Andrei Vagin <avagin@gmail.com>
+---
+ criu/pie/parasite-vdso.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/criu/pie/parasite-vdso.c b/criu/pie/parasite-vdso.c
+index 38da766..3a1684d 100644
+--- a/criu/pie/parasite-vdso.c
++++ b/criu/pie/parasite-vdso.c
+@@ -119,9 +119,9 @@ int vdso_do_park(struct vdso_maps *rt, unsigned long addr, unsigned long space)
+ 	BUG_ON((vdso_size + vvar_size) < space);
+ 
+ 	if (rt->sym.vdso_before_vvar)
+-		return park_at(rt, addr, addr + vvar_size);
++		return park_at(rt, addr, addr + vdso_size);
+ 	else
+-		return park_at(rt, addr + vdso_size, addr);
++		return park_at(rt, addr + vvar_size, addr);
+ }
+ 
+ #ifndef CONFIG_COMPAT
+-- 
+2.9.5
+
