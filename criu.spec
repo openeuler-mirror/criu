@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.13
-Release:       9
+Release:       10
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -26,6 +26,7 @@ Patch0008:     0008-aarch64-use-clone3-if-possible.patch
 Patch0009:     0009-criu-dump-and-restore-cpu-affinity-of-each-thread.patch
 Patch0010:     0010-vdso-fix-segmentation-fault-caused-by-char-pointer-a.patch
 Patch0011:     0011-vdso-use-correct-offsets-to-remap-vdso-and-vvar-mapp.patch
+Patch0012:     0012-add-pin-memory-method-for-criu.patch
 
 %description
 Checkpoint/Restore in Userspace(CRIU),is a software tool for the linux operating system.
@@ -99,6 +100,9 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*}
 
 %changelog
+* Mon Mar 1 2021 Jingxian He <hejingxian@huawei.com> - 3.13-10
+- Add pin memory method for criu
+
 * Mon Mar 1 2021 snoweay <snoweay@163.com> - 3.13-9
 - Fix bug of one vdso segmentfault.
   Use correct offsets to remap vdso and vvar mappings.
