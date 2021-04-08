@@ -1,10 +1,10 @@
 Name:          criu
-Version:       3.13
-Release:       7
+Version:       3.15
+Release:       1
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
-License:       GPLv2
+License:       GPL-2.0-or-later or LGPL-2.1-only
 URL:           http://criu.org/
 Source0:       http://download.openvz.org/criu/criu-%{version}.tar.bz2
 BuildRequires: systemd libnet-devel asciidoc xmlto perl-interpreter libselinux-devel
@@ -91,6 +91,9 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*}
 
 %changelog
+* Thu Apr 08 2021 fu.lin <fulin10@huawei.com> - 3.15-1
+- bump the criu version to v3.15
+
 * Tue Sep 22 2020 lingsheng <lingsheng@huawei.com> - 3.13-7
 - Fix crit errors
 
