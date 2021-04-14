@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.15
-Release:       1
+Release:       2
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -18,6 +18,9 @@ Obsoletes:     %{name}-libs < %{version}-%{release}
 Patch0001:     0001-Fix-crit-encode-TypeError.patch
 Patch0002:     0002-Fix-crit-info-struct-unpack-error.patch
 Patch0003:     0003-Fix-crit-x-UnicodeDecodeError.patch
+Patch0004:     0004-criu-dump-and-restore-cpu-affinity-of-each-thread.patch
+Patch0005:     0005-vdso-fix-segmentation-fault-caused-by-char-pointer-a.patch
+Patch0006:     0006-criu-add-pin-memory-method.patch
 
 %description
 Checkpoint/Restore in Userspace(CRIU),is a software tool for the linux operating system.
