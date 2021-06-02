@@ -1,13 +1,13 @@
 Name:          criu
 Version:       3.15
-Release:       2
+Release:       3
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
 License:       GPL-2.0-or-later or LGPL-2.1-only
 URL:           http://criu.org/
 Source0:       http://download.openvz.org/criu/criu-%{version}.tar.bz2
-BuildRequires: systemd libnet-devel asciidoc xmlto perl-interpreter libselinux-devel
+BuildRequires: systemd libnet-devel asciidoc xmlto perl-interpreter libselinux-devel gcc
 BuildRequires: protobuf-devel protobuf-c-devel python3-devel libnl3-devel libcap-devel
 Recommends:    tar
 ExclusiveArch: x86_64 %{arm} ppc64le aarch64 s390x
@@ -94,6 +94,9 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*}
 
 %changelog
+* Mon May 31 2021 baizhonggui <baizhonggui@huawei.com> - 3.15-3
+- Add gcc in BuildRequires
+
 * Thu Apr 08 2021 fu.lin <fulin10@huawei.com> - 3.15-1
 - bump the criu version to v3.15
 
