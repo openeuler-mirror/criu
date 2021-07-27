@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.15
-Release:       2
+Release:       3
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -21,6 +21,7 @@ Patch0003:     0003-Fix-crit-x-UnicodeDecodeError.patch
 Patch0004:     0004-criu-dump-and-restore-cpu-affinity-of-each-thread.patch
 Patch0005:     0005-vdso-fix-segmentation-fault-caused-by-char-pointer-a.patch
 Patch0006:     0006-criu-add-pin-memory-method.patch
+Patch0007:     0007-criu-add-pid-recover-method-for-criu.patch
 
 %description
 Checkpoint/Restore in Userspace(CRIU),is a software tool for the linux operating system.
@@ -94,6 +95,12 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*}
 
 %changelog
+* Fri Jul 23 2021 snoweay <snoweay@163.com> - 3.15-3
+- Add pid recover method for criu
+
+* Tue Apr 13 2021 fu.lin <fulin10@huawei.com> - 3.15-2
+- Backport patch set for seamless kernel upgrade
+
 * Thu Apr 08 2021 fu.lin <fulin10@huawei.com> - 3.15-1
 - bump the criu version to v3.15
 
