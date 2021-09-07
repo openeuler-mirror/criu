@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.15
-Release:       3
+Release:       4
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -60,7 +60,7 @@ Help documents for criu.
 %autosetup -n %{name}-%{version} -p1
 
 %build
-CFLAGS+=`echo %{optflags} | sed -e 's,-fstack-protector\S*,,g'` make V=1 WERROR=0 PREFIX=%{_prefix} RUNDIR=/run/criu PYTHON=python3
+CFLAGS+=`echo %{optflags}` make V=1 WERROR=0 PREFIX=%{_prefix} RUNDIR=/run/criu PYTHON=python3
 
 %install
 make install-criu DESTDIR=%{buildroot} PREFIX=%{_prefix} LIBDIR=%{_libdir}
@@ -94,6 +94,9 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*}
 
 %changelog
+* Tue Sep 07 2021 chenchen <chen_aka_jan@163.com> - 3.15-4
+- add "-fstack-protector-strong" for libcriu.so.2.0
+
 * Mon May 31 2021 baizhonggui <baizhonggui@huawei.com> - 3.15-3
 - Add gcc in BuildRequires
 
