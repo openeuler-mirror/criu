@@ -1,12 +1,12 @@
 Name:          criu
-Version:       3.15
-Release:       4
+Version:       3.16.1
+Release:       1
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
 License:       GPL-2.0-or-later or LGPL-2.1-only
 URL:           http://criu.org/
-Source0:       http://download.openvz.org/criu/criu-%{version}.tar.bz2
+Source0:       http://github.com/chechpoint-restore/criu/archive/v%{version}/%{name}-%{version}.tar.gz
 BuildRequires: systemd libnet-devel asciidoc xmlto perl-interpreter libselinux-devel gcc
 BuildRequires: protobuf-devel protobuf-c-devel python3-devel libnl3-devel libcap-devel
 Recommends:    tar
@@ -15,12 +15,7 @@ Requires:      %{name} = %{version}-%{release}
 Provides:      %{name}-libs = %{version}-%{release}
 Obsoletes:     %{name}-libs < %{version}-%{release}
 
-Patch0001:     0001-Fix-crit-encode-TypeError.patch
-Patch0002:     0002-Fix-crit-info-struct-unpack-error.patch
-Patch0003:     0003-Fix-crit-x-UnicodeDecodeError.patch
-Patch0004:     0004-criu-dump-and-restore-cpu-affinity-of-each-thread.patch
-Patch0005:     0005-vdso-fix-segmentation-fault-caused-by-char-pointer-a.patch
-Patch0006:     0006-criu-add-pin-memory-method.patch
+Patch1:     0001-criu-dump-and-restore-cpu-affinity-of-each-thread.patch
 
 %description
 Checkpoint/Restore in Userspace(CRIU),is a software tool for the linux operating system.
@@ -49,6 +44,12 @@ Requires: python3-criu = %{version}-%{release}
 
 %description -n crit
 A tool for CRIU image.
+
+%package -n criu-ns
+Summary: Tool to run CRIU in different namespaces
+Requires: %{name} = %{version}-%{release}
+
+%description -n criu-ns
 
 %package help
 Summary:  Help documents for criu
@@ -88,12 +89,18 @@ chmod 0755 %{buildroot}/run/%{name}/
 %files -n crit
 %{_bindir}/crit
 
+%files -n criu-ns
+%{_sbindir}/criu-ns
+
 %files help
 %doc README.md COPYING
 %doc %{_mandir}/man8/criu.8*
-%doc %{_mandir}/man1/{compel.1*,crit.1*}
+%doc %{_mandir}/man1/{compel.1*,crit.1*,criu-ns.1*}
 
 %changelog
+* Fri Dec 24 2021 zhouwenpei <zhouwenpei11@huawei.com> - 3.16.1-1
+- upgrade criu version to 3.16.1
+
 * Tue Sep 07 2021 chenchen <chen_aka_jan@163.com> - 3.15-4
 - add "-fstack-protector-strong" for libcriu.so.2.0
 
