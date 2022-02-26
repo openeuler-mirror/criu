@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.16.1
-Release:       1
+Release:       2
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -16,6 +16,7 @@ Provides:      %{name}-libs = %{version}-%{release}
 Obsoletes:     %{name}-libs < %{version}-%{release}
 
 Patch1:     0001-criu-dump-and-restore-cpu-affinity-of-each-thread.patch
+Patch2:     0002-mm-add-pin-memory-method-for-criu.patch
 
 %description
 Checkpoint/Restore in Userspace(CRIU),is a software tool for the linux operating system.
@@ -98,6 +99,9 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*,criu-ns.1*}
 
 %changelog
+* Sat Feb 26 2022 luolongjun <luolongjuna@gmail.com> - 3.16.1-2
+- add support for pin memory
+
 * Fri Dec 24 2021 zhouwenpei <zhouwenpei11@huawei.com> - 3.16.1-1
 - upgrade criu version to 3.16.1
 
