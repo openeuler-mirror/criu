@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.16.1
-Release:       2
+Release:       3
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -17,6 +17,21 @@ Obsoletes:     %{name}-libs < %{version}-%{release}
 
 Patch1:     0001-criu-dump-and-restore-cpu-affinity-of-each-thread.patch
 Patch2:     0002-mm-add-pin-memory-method-for-criu.patch
+Patch3:     0002-compel-add-rseq-syscall-into-compel-std-plugin-sysca.patch
+Patch4:     0003-kerndat-check-for-rseq-syscall-support.patch
+Patch5:     0004-util-move-fork_and_ptrace_attach-helper-from-cr-chec.patch
+Patch6:     0005-cr-check-Add-ptrace-rseq-conf-dump-feature.patch
+Patch7:     0006-rseq-initial-support.patch
+Patch8:     0007-zdtm-add-simple-test-for-rseq-C-R.patch
+Patch9:     0008-ci-add-Fedora-Rawhide-based-test-on-Cirrus.patch
+Patch10:    0009-include-add-thread_pointer.h-from-Glibc.patch
+Patch11:    0010-clone-noasan-unregister-rseq-at-the-thread-start-for.patch
+Patch12:    0011-zdtm-static-rseq00-fix-rseq-test-when-linking-with-a.patch
+Patch13:    0012-compel-add-helpers-to-get-set-instruction-pointer.patch
+Patch14:    0013-cr-dump-fixup-thread-IP-when-inside-rseq-cs.patch
+Patch15:    0014-zdtm-add-rseq-transition-test-for-amd64.patch
+Patch16:    0015-cr-dump-handle-rseq-flags-field.patch
+Patch17:    0016-zdtm-add-rseq02-transition-test-with-NO_RESTART-CS-f.patch
 
 %description
 Checkpoint/Restore in Userspace(CRIU),is a software tool for the linux operating system.
@@ -99,6 +114,9 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*,criu-ns.1*}
 
 %changelog
+* Fri Mar 4 2022 ningyu <ningyu9@huawei.com> - 3.16.1-3
+- rseq c/r support
+
 * Sat Feb 26 2022 luolongjun <luolongjuna@gmail.com> - 3.16.1-2
 - add support for pin memory
 
