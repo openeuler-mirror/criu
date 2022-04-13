@@ -1,0 +1,39 @@
+From 88274e29aaaec4a53df996ae84c37ad20f36395f Mon Sep 17 00:00:00 2001
+From: Zhuling <zhuling8@huawei.com>
+Date: Sat, 24 Jul 2021 16:37:17 +0800
+Subject: [PATCH 43/72] fix dump fail problem with no access to get socket
+ filter
+
+Someone uses bpf hook by writing the kernel function instead
+of the bpf code, it causes the error here.
+
+Fix socket dumping fail problem when user space has no access
+to getting socket filter.
+
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/sockets.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/criu/sockets.c b/criu/sockets.c
+index 2ddf85e..e412a1d 100644
+--- a/criu/sockets.c
++++ b/criu/sockets.c
+@@ -355,7 +355,12 @@ static int dump_socket_filter(int sk, SkOptsEntry *soe)
+ 
+ 	ret = getsockopt(sk, SOL_SOCKET, SO_GET_FILTER, NULL, &len);
+ 	if (ret) {
+-		pr_perror("Can't get socket filter len");
++		pr_warn("Can't get socket filter len");
++		/* Someone uses bpf hook by writing the kernel function
++		 * instead of the bpf code, it causes the error here.
++		 */
++		if (errno == EACCES)
++			return 0;
+ 		return ret;
+ 	}
+ 
+-- 
+2.34.1
+

@@ -1,0 +1,47 @@
+From 92fd13a21e52343b532eb1a163a159303107a6e2 Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Thu, 24 Jun 2021 16:56:02 +0800
+Subject: [PATCH 36/72] add O_REPAIR flag to vma fd
+
+Add O_REPAIR flag when openning vma fd.
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/21
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+---
+ criu/files-reg.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/criu/files-reg.c b/criu/files-reg.c
+index b9576a4..7bd8592 100644
+--- a/criu/files-reg.c
++++ b/criu/files-reg.c
+@@ -2255,6 +2255,7 @@ void filemap_ctx_fini(void)
+ 	}
+ }
+ 
++#define O_REPAIR        040000000
+ static int open_filemap(int pid, struct vma_area *vma)
+ {
+ 	u32 flags;
+@@ -2267,13 +2268,15 @@ static int open_filemap(int pid, struct vma_area *vma)
+ 	 */
+ 
+ 	BUG_ON((vma->vmfd == NULL) || !vma->e->has_fdflags);
+-	flags = vma->e->fdflags;
++	flags = vma->e->fdflags | O_REPAIR;
+ 
+ 	if (ctx.flags != flags || ctx.desc != vma->vmfd) {
+ 		if (vma->e->status & VMA_AREA_MEMFD)
+ 			ret = memfd_open(vma->vmfd, &flags);
+-		else
++		else {
++
+ 			ret = open_path(vma->vmfd, do_open_reg_noseek_flags, &flags);
++		}
+ 		if (ret < 0)
+ 			return ret;
+ 
+-- 
+2.34.1
+

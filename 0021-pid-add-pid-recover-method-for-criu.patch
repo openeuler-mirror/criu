@@ -1,0 +1,213 @@
+From 2911f505eefcfaea582d457c1fa18df34d151954 Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Wed, 19 May 2021 21:33:22 +0800
+Subject: [PATCH 21/72] pid: add pid recover method for criu
+
+The default pid recover method cannot recover the task
+pid at every time.
+We add a new pid recover method by setting the fork_pid of
+the parent task struct, add the kernel will alloc pid by
+the fork_pid.
+The new pid recover method can also avoid other tasks using
+the dumping task pids.
+
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+---
+ criu/config.c             |  1 +
+ criu/cr-restore.c         | 27 ++++++++++++++++++++++++++-
+ criu/crtools.c            |  1 +
+ criu/include/cr_options.h |  1 +
+ criu/include/pin-mem.h    |  4 ++++
+ criu/include/restorer.h   |  1 +
+ criu/pie/restorer.c       | 25 ++++++++++++++++++++++++-
+ 7 files changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/criu/config.c b/criu/config.c
+index 53a5cfd..6dfbb01 100644
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -699,6 +699,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		BOOL_OPT("pin-memory", &opts.pin_memory),
+ 		{ "lsm-mount-context", required_argument, 0, 1099 },
+ 		{ "network-lock", required_argument, 0, 1100 },
++		BOOL_OPT("use-fork-pid", &opts.use_fork_pid),
+ 		{},
+ 	};
+ 
+diff --git a/criu/cr-restore.c b/criu/cr-restore.c
+index 5514c29..497dd14 100644
+--- a/criu/cr-restore.c
++++ b/criu/cr-restore.c
+@@ -80,6 +80,7 @@
+ #include "timens.h"
+ #include "bpfmap.h"
+ #include "apparmor.h"
++#include "pin-mem.h"
+ 
+ #include "parasite-syscall.h"
+ #include "files-reg.h"
+@@ -1340,6 +1341,23 @@ static int set_next_pid(void *arg)
+ 	return 0;
+ }
+ 
++static int write_fork_pid(int pid)
++{
++	int fd, ret;
++
++	fd = open(PIN_MEM_FILE, O_RDWR);
++	if (fd < 0) {
++		pr_warn("error open file: %s\n", PIN_MEM_FILE);
++		return -1;
++	}
++	ret = ioctl(fd, SET_FORK_PID, &pid);
++	if (ret < 0) {
++		pr_warn("write fork pid fail, errno: %s\n", strerror(errno));
++	}
++	close(fd);
++	return ret;
++}
++
+ static inline int fork_with_pid(struct pstree_item *item)
+ {
+ 	struct cr_clone_arg ca;
+@@ -1424,7 +1442,7 @@ static inline int fork_with_pid(struct pstree_item *item)
+ 	if (!(ca.clone_flags & CLONE_NEWPID)) {
+ 		lock_last_pid();
+ 
+-		if (!kdat.has_clone3_set_tid) {
++		if (!kdat.has_clone3_set_tid && !opts.use_fork_pid) {
+ 			if (external_pidns) {
+ 				/*
+ 				 * Restoring into another namespace requires a helper
+@@ -1434,6 +1452,12 @@ static inline int fork_with_pid(struct pstree_item *item)
+ 				 */
+ 				ret = call_in_child_process(set_next_pid, (void *)&pid);
+ 			} else {
++				if (opts.use_fork_pid) {
++					ret = write_fork_pid(pid);
++					if (ret < 0)
++						goto err_unlock;
++				}
++
+ 				ret = set_next_pid((void *)&pid);
+ 			}
+ 			if (ret != 0) {
+@@ -3886,6 +3910,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
+ 		task_args->thread_args);
+ 
+ 	task_args->pin_memory = opts.pin_memory;
++	task_args->use_fork_pid = opts.use_fork_pid;
+ 
+ 	/*
+ 	 * An indirect call to task_restore, note it never returns
+diff --git a/criu/crtools.c b/criu/crtools.c
+index 1b90481..502acdf 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -448,6 +448,7 @@ usage:
+ 	       "  --with-cpu-affinity Allow to restore cpu affinity. Only for hosts with\n"
+ 	       "			same cpu quantity.\n"
+ 	       "  --pin-memory		Use pin memory method for checkpoint and restore.\n"
++	       "  --use-fork-pid	Allow to restore task pid by setting fork pid of task struct.\n"
+ 	       "\n"
+ 	       "Check options:\n"
+ 	       "  Without options, \"criu check\" checks availability of absolutely required\n"
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index 61898fd..923cc5f 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -191,6 +191,7 @@ struct cr_options {
+ 	/* restore cpu affinity */
+ 	int with_cpu_affinity;
+ 	int pin_memory;
++	int use_fork_pid;
+ };
+ 
+ extern struct cr_options opts;
+diff --git a/criu/include/pin-mem.h b/criu/include/pin-mem.h
+index 7e53b12..2b54996 100644
+--- a/criu/include/pin-mem.h
++++ b/criu/include/pin-mem.h
+@@ -6,6 +6,7 @@
+ #include "vma.pb-c.h"
+ 
+ #if __has_include("linux/pin_memory.h")
++# define CONFIG_PID_RESERVE
+ # include <linux/pin_memory.h>
+ #else
+ 
+@@ -35,6 +36,9 @@ struct pin_mem_area_set {
+ 	struct _pin_mem_area mem_area[MAX_PIN_MEM_AREA_NUM];
+ };
+ 
++#define _SET_FORK_PID	8
++#define SET_FORK_PID		_IOW(PIN_MEM_MAGIC, _SET_FORK_PID, int)
++
+ #endif /* __has_include("linux/pin_memory.h") */
+ 
+ #define PIN_MEM_FILE	"/dev/pinmem"
+diff --git a/criu/include/restorer.h b/criu/include/restorer.h
+index e0bdc04..93f87f4 100644
+--- a/criu/include/restorer.h
++++ b/criu/include/restorer.h
+@@ -233,6 +233,7 @@ struct task_restore_args {
+ 	int child_subreaper;
+ 	bool has_clone3_set_tid;
+ 	bool pin_memory;
++	bool use_fork_pid;
+ } __aligned(64);
+ 
+ /*
+diff --git a/criu/pie/restorer.c b/criu/pie/restorer.c
+index db01ba5..1317582 100644
+--- a/criu/pie/restorer.c
++++ b/criu/pie/restorer.c
+@@ -1426,6 +1426,22 @@ int remap_vmas(int pid)
+ 	return ret;
+ }
+ 
++int write_fork_pid(int pid)
++{
++	int fd, ret;
++
++	fd = sys_open(PIN_MEM_FILE, O_RDWR, 0);
++	if (fd < 0) {
++		pr_warn("error open file: %s\n", PIN_MEM_FILE);
++		return -1;
++	}
++	ret = sys_ioctl(fd, SET_FORK_PID, (unsigned long) &pid);
++	if (ret < 0) {
++		pr_warn("write fork pid fail fail: %d\n", pid);
++	}
++	sys_close(fd);
++	return ret;
++}
+ 
+ /*
+  * The main routine to restore task via sigreturn.
+@@ -1815,7 +1831,7 @@ long __export_restore_task(struct task_restore_args *args)
+ 		long parent_tid;
+ 		int i, fd = -1;
+ 
+-		if (!args->has_clone3_set_tid) {
++		if (!args->has_clone3_set_tid && !args->use_fork_pid) {
+ 			/* One level pid ns hierarhy */
+ 			fd = sys_openat(args->proc_fd, LAST_PID_PATH, O_RDWR, 0);
+ 			if (fd < 0) {
+@@ -1847,6 +1863,13 @@ long __export_restore_task(struct task_restore_args *args)
+ 				pr_debug("Using clone3 to restore the process\n");
+ 				RUN_CLONE3_RESTORE_FN(ret, c_args, sizeof(c_args), &thread_args[i],
+ 						      args->clone_restore_fn);
++			} else if (args->use_fork_pid) {
++				if (write_fork_pid(thread_args[i].pid) < 0) {
++					pr_err("Clone fail with fork pid\n");
++					mutex_unlock(&task_entries_local->last_pid_mutex);
++					goto core_restore_end;
++				}
++				RUN_CLONE_RESTORE_FN(ret, clone_flags, new_sp, parent_tid, thread_args, args->clone_restore_fn);
+ 			} else {
+ 				last_pid_len =
+ 					std_vprint_num(last_pid_buf, sizeof(last_pid_buf), thread_args[i].pid - 1, &s);
+-- 
+2.34.1
+

@@ -1,0 +1,37 @@
+From 803ee02298e0a71b07cf611eee68e23f702d259e Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Thu, 16 Sep 2021 13:50:46 +0000
+Subject: [PATCH 48/72] fds: fix fds list restore
+
+When there exist multi processes need to dump, the child process may
+have the same fds as parent process. During the restore processing,
+criu choose the process which has the min pid value to be the master
+process to recover fds. However, choosing the parent process as the
+master process is more suitable.
+
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+---
+ criu/files.c | 7 +------
+ 1 file changed, 1 insertion(+), 6 deletions(-)
+
+diff --git a/criu/files.c b/criu/files.c
+index 24ed219..6d8b812 100644
+--- a/criu/files.c
++++ b/criu/files.c
+@@ -906,12 +906,7 @@ static struct fdinfo_list_entry *alloc_fle(int pid, FdinfoEntry *fe)
+ 
+ static void __collect_desc_fle(struct fdinfo_list_entry *new_le, struct file_desc *fdesc)
+ {
+-	struct fdinfo_list_entry *le;
+-
+-	list_for_each_entry_reverse(le, &fdesc->fd_info_head, desc_list)
+-		if (pid_rst_prio_eq(le->pid, new_le->pid))
+-			break;
+-	list_add(&new_le->desc_list, &le->desc_list);
++	list_add(&new_le->desc_list, &fdesc->fd_info_head);
+ }
+ 
+ static void collect_desc_fle(struct fdinfo_list_entry *new_le, struct file_desc *fdesc, bool force_master)
+-- 
+2.34.1
+

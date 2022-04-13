@@ -1,0 +1,145 @@
+From b766a8d6b04e9c358cd221b68405a205156c1fe2 Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Thu, 17 Feb 2022 17:19:46 +0800
+Subject: [PATCH 69/72] zdtm: add share port testcase
+
+---
+ test/zdtm/customization/Makefile   |   3 +-
+ test/zdtm/customization/tcp00.c    | 101 +++++++++++++++++++++++++++++
+ test/zdtm/customization/tcp00.desc |   1 +
+ 3 files changed, 104 insertions(+), 1 deletion(-)
+ create mode 100644 test/zdtm/customization/tcp00.c
+ create mode 100644 test/zdtm/customization/tcp00.desc
+
+diff --git a/test/zdtm/customization/Makefile b/test/zdtm/customization/Makefile
+index 728646b..1111908 100644
+--- a/test/zdtm/customization/Makefile
++++ b/test/zdtm/customization/Makefile
+@@ -13,7 +13,8 @@ TST_NOFILE	=	\
+ 		maps008	\
+ 		notifier00	\
+ 		chardev00	\
+-		infiniband_with_unix_sk
++		infiniband_with_unix_sk	\
++		tcp00
+ 
+ TST_FILE	=	\
+ 		maps00	\
+diff --git a/test/zdtm/customization/tcp00.c b/test/zdtm/customization/tcp00.c
+new file mode 100644
+index 0000000..d1ead82
+--- /dev/null
++++ b/test/zdtm/customization/tcp00.c
+@@ -0,0 +1,101 @@
++#include <stdio.h>
++#include <stdbool.h>
++#include <unistd.h>
++#include <string.h>
++#include <arpa/inet.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include "zdtmtst.h"
++
++#define PORT    17173
++
++const char *test_doc = "Test TCP SO_REUSEADDR checkpoint/restore using `share_{src,dst}_ports`";
++
++static int sock_bind_and_listen(void)
++{
++        int serv_sk;
++        int optval = 1;
++        struct sockaddr_in serv = {
++                .sin_family = AF_INET,
++                .sin_addr.s_addr = htonl(INADDR_ANY),
++                .sin_port = htons(PORT),
++        };
++
++        serv_sk = socket(AF_INET, SOCK_STREAM, 0);
++        if (serv_sk < 0) {
++                pr_perror("server socket failed");
++                exit(1);
++        }
++
++        if (setsockopt(serv_sk, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
++                pr_perror("setsockopt");
++                exit(1);
++        }
++
++        if (bind(serv_sk, (struct sockaddr *)&serv, sizeof(serv)) < 0) {
++                pr_perror("bind");
++                exit(1);
++        }
++
++        if (listen(serv_sk, 5) != 0) {
++                pr_perror("listen");
++                exit(1);
++        }
++
++        return serv_sk;
++}
++
++static void client_connect(void)
++{
++    int sk;
++	struct sockaddr_in sockaddr = {
++		.sin_family = AF_INET,
++	};
++
++    sk = socket(AF_INET, SOCK_STREAM, 0);
++    if (sk < 0) {
++        pr_perror("client socket failed");
++        exit(1);
++    }
++
++	sockaddr.sin_addr.s_addr = inet_addr("127.0.0.1");
++	sockaddr.sin_port = htons(PORT);
++
++    if (connect(sk, (struct sockaddr *)&sockaddr, sizeof(sockaddr)) < 0) {
++        pr_perror("connect failed");
++        exit(1);
++    }
++
++    close(sk);
++}
++
++int main(int argc, char *argv[])
++{
++        int serv_sk;
++        int optval = 0;
++        socklen_t len = sizeof(optval);
++
++        test_init(argc, argv);
++
++        serv_sk = sock_bind_and_listen();
++
++        test_msg("listen 0.0.0.0: %d\n", PORT);
++        /* create CLOSE-WAIT status socket */
++        client_connect();
++
++        test_daemon();
++        test_waitsig();
++
++        if (getsockopt(serv_sk, SOL_SOCKET, SO_REUSEADDR, &optval, &len) != 0) {
++            pr_perror("getsockopt failed");
++            return -1;
++        }
++
++        if (optval != 1) {
++            pr_err("SO_REUSEADDR flag is %d, should 1", optval);
++        } else
++            pass();
++
++        return 0;
++}
+\ No newline at end of file
+diff --git a/test/zdtm/customization/tcp00.desc b/test/zdtm/customization/tcp00.desc
+new file mode 100644
+index 0000000..bc3b4a8
+--- /dev/null
++++ b/test/zdtm/customization/tcp00.desc
+@@ -0,0 +1 @@
++{'arch': 'aarch64', 'opts': '--use-fork-pid --share-src-ports=17173 --share-dst-ports=17173 --skip-in-flight', 'flavor': 'h', 'sysfs': '/sys/kernel/repair_share_socket'}
+-- 
+2.34.1
+

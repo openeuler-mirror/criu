@@ -1,0 +1,2091 @@
+From 4f9fed183bcfda1285d7e99136ff02e3778012ba Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Tue, 25 Jan 2022 19:00:33 +0800
+Subject: [PATCH 63/72] zdtm: add pinmem testcase
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ test/zdtm.py                                |  68 ++-
+ test/zdtm/customization/Makefile            |  23 +-
+ test/zdtm/customization/get_smaps_bits.c    | 127 +++++
+ test/zdtm/customization/get_smaps_bits.h    |   6 +
+ test/zdtm/customization/ipc.desc            |   2 +-
+ test/zdtm/customization/maps00.c            | 271 +++++++++++
+ test/zdtm/customization/maps00.desc         |   1 +
+ test/zdtm/customization/maps007.c           | 178 +++++++
+ test/zdtm/customization/maps007.desc        |   1 +
+ test/zdtm/customization/maps008.c           | 514 ++++++++++++++++++++
+ test/zdtm/customization/maps008.desc        |   1 +
+ test/zdtm/customization/maps01.c            | 183 +++++++
+ test/zdtm/customization/maps01.desc         |   1 +
+ test/zdtm/customization/maps02.c            | 111 +++++
+ test/zdtm/customization/maps02.desc         |   1 +
+ test/zdtm/customization/maps04.c            |  57 +++
+ test/zdtm/customization/maps04.desc         |   1 +
+ test/zdtm/customization/maps05.c            |  91 ++++
+ test/zdtm/customization/maps05.desc         |   1 +
+ test/zdtm/customization/maps06.c            |  70 +++
+ test/zdtm/customization/maps06.desc         |   1 +
+ test/zdtm/customization/maps_file_prot.c    |  53 ++
+ test/zdtm/customization/maps_file_prot.desc |   1 +
+ test/zdtm_ct.c                              |  13 +-
+ 24 files changed, 1766 insertions(+), 10 deletions(-)
+ create mode 100644 test/zdtm/customization/get_smaps_bits.c
+ create mode 100644 test/zdtm/customization/get_smaps_bits.h
+ create mode 100644 test/zdtm/customization/maps00.c
+ create mode 100644 test/zdtm/customization/maps00.desc
+ create mode 100644 test/zdtm/customization/maps007.c
+ create mode 100644 test/zdtm/customization/maps007.desc
+ create mode 100644 test/zdtm/customization/maps008.c
+ create mode 100644 test/zdtm/customization/maps008.desc
+ create mode 100644 test/zdtm/customization/maps01.c
+ create mode 100644 test/zdtm/customization/maps01.desc
+ create mode 100644 test/zdtm/customization/maps02.c
+ create mode 100644 test/zdtm/customization/maps02.desc
+ create mode 100644 test/zdtm/customization/maps04.c
+ create mode 100644 test/zdtm/customization/maps04.desc
+ create mode 100644 test/zdtm/customization/maps05.c
+ create mode 100644 test/zdtm/customization/maps05.desc
+ create mode 100644 test/zdtm/customization/maps06.c
+ create mode 100644 test/zdtm/customization/maps06.desc
+ create mode 100644 test/zdtm/customization/maps_file_prot.c
+ create mode 100644 test/zdtm/customization/maps_file_prot.desc
+
+diff --git a/test/zdtm.py b/test/zdtm.py
+index 1b2c7da..d3b146f 100755
+--- a/test/zdtm.py
++++ b/test/zdtm.py
+@@ -367,6 +367,9 @@ def test_flag(tdesc, flag):
+     return flag in tdesc.get('flags', '').split()
+ 
+ 
++def test_value(tdesc, opt, val):
++    return val in tdesc.get(opt, '').split()
++
+ #
+ # Exception thrown when something inside the test goes wrong,
+ # e.g. test doesn't start, criu returns with non zero code or
+@@ -1445,6 +1448,24 @@ class criu:
+             "check", ["--no-default-config", "-v0", "--feature", feature],
+             opts['criu_bin']) == 0
+ 
++    @staticmethod
++    def check_cmdline(cmdline):
++        with open("/proc/cmdline") as f:
++            bootparams = f.readline().strip().split()
++
++        for arg in cmdline.split():
++            words = [word.strip("'\" ") for word in arg.split('=')]
++            matched = False
++            for param in bootparams:
++                prefix = param.startswith(words[0])
++                if (len(words) == 1 and prefix) \
++                        or (len(words) == 2 and prefix and param[len(words[0])+1:] == words[1]):
++                    matched = True
++                    break
++            if not matched:
++                return True
++        return False
++
+     @staticmethod
+     def available():
+         if not os.access(opts['criu_bin'], os.X_OK):
+@@ -1516,6 +1537,11 @@ def cr(cr_api, test, opts):
+ 
+     iters = iter_parm(opts['iters'], 1)
+     for i in iters[0]:
++        if "--pin-memory" in test.getdopts():
++            print("Clear pin memory space")
++            cmd = [opts["criu_bin"], "clear-pin-memory"]
++            subprocess.run(cmd, shell=False, check=True)
++
+         pres = iter_parm(opts['pre'], 0)
+         for p in pres[0]:
+             if opts['snaps']:
+@@ -1965,6 +1991,21 @@ class Launcher:
+             testline = u"ok %d - %s # SKIP %s" % (self.__runtest, name, reason)
+             print(testline, file=self.__file_report)
+ 
++    def modprobe_pin_memory(self, load):
++        if not load:
++            return
++        else:
++            found = False
++            with open("/proc/modules") as f:
++                for line in f.readlines():
++                    if "pin_memory" == line.split()[0]:
++                        found = True
++            if not found:
++                subprocess.check_call(["modprobe", "pin_memory"])
++
++            cmd = [opts["criu_bin"], "init-pagemap-read"]
++            subprocess.check_call(cmd, shell=False)
++
+     def run_test(self, name, desc, flavor):
+ 
+         if len(self.__subs) >= self.__max:
+@@ -1972,7 +2013,8 @@ class Launcher:
+ 
+         with open("/proc/sys/kernel/tainted") as taintfd:
+             taint = taintfd.read()
+-        if self.__taint != taint:
++        # 0x1000 means the out of tree module has been loaded
++        if self.__taint != taint and (int(self.__taint) | 0x1000) != int(taint):
+             raise Exception("The kernel is tainted: %r (%r)" %
+                             (taint, self.__taint))
+ 
+@@ -1997,8 +2039,15 @@ class Launcher:
+             logf = None
+             log = None
+ 
++        no_pid_ns = test_value(desc, 'opts', '--use-fork-pid')
++        zdtm_no_pid_ns = "1" if no_pid_ns else "0"
++        # load `pin_memory.ko`，`--pin-memory` option must be used with
++        # `--use-fork-pid`, so don't care `--pin-memory` option
++        self.modprobe_pin_memory(no_pid_ns)
++
+         sub = subprocess.Popen(["./zdtm_ct", "zdtm.py"],
+-                               env=dict(os.environ, CR_CT_TEST_INFO=arg),
++                               env=dict(os.environ, CR_CT_TEST_INFO=arg,
++                                        ZDTM_NO_PID_NS=zdtm_no_pid_ns),
+                                stdout=log,
+                                stderr=subprocess.STDOUT,
+                                close_fds=True)
+@@ -2009,7 +2058,8 @@ class Launcher:
+             "start": time.time()
+         }
+ 
+-        if test_flag(desc, 'excl'):
++        # pin memory function don't support concurrency
++        if test_flag(desc, 'excl') or test_value(desc, "opts", "--pin-memory"):
+             self.wait()
+ 
+     def __wait_one(self, flags):
+@@ -2356,6 +2406,12 @@ def run_tests(opts):
+                     launcher.skip(t, "remote lazy pages are not supported")
+                     continue
+ 
++            cmdline = tdesc.get('cmdline', '')
++            if cmdline and criu.check_cmdline(cmdline):
++                launcher.skip(
++                    t, f"cmdline '{cmdline}' isn't support, or don't set")
++                continue
++
+             test_flavs = tdesc.get('flavor', 'h ns uns').split()
+             opts_flavs = (opts['flavor'] or 'h,ns,uns').split(',')
+             if opts_flavs != ['best']:
+@@ -2385,6 +2441,7 @@ def run_tests(opts):
+         if fail:
+             sys.exit(1)
+ 
++
+ sti_fmt = "%-40s%-10s%s"
+ 
+ 
+@@ -2664,8 +2721,8 @@ rp.add_argument("--pre-dump-mode",
+                 choices=['splice', 'read'],
+                 default='splice')
+ rp.add_argument("--kdat",
+-		help="Path to criu.kdat, default '/run/criu.kdat'",
+-		default="/run/criu.kdat")
++                help="Path to criu.kdat, default '/run/criu.kdat'",
++                default="/run/criu.kdat")
+ 
+ lp = sp.add_parser("list", help="List tests")
+ lp.set_defaults(action=list_tests)
+@@ -2700,6 +2757,7 @@ if opts['action'] == 'run':
+     kdat = pathlib.Path(opts['kdat'])
+     if kdat.exists():
+         kdat.unlink()
++
+ for tst in test_classes.values():
+     tst.available()
+ 
+diff --git a/test/zdtm/customization/Makefile b/test/zdtm/customization/Makefile
+index 563b7b1..82348f2 100644
+--- a/test/zdtm/customization/Makefile
++++ b/test/zdtm/customization/Makefile
+@@ -3,9 +3,21 @@ LIB	:= $(LIBDIR)/libzdtmtst.a
+ LDLIBS	+= $(LIB)
+ CPPFLAGS += -I$(LIBDIR)
+ 
+-TST	=	\
+-		ipc
++TST_NOFILE	=	\
++		ipc		\
++		maps01	\
++		maps02	\
++		maps04	\
++		maps05	\
++		maps007	\
++		maps008
+ 
++TST_FILE	=	\
++		maps00	\
++		maps06	\
++		maps_file_prot
++
++TST = $(TST_NOFILE) $(TST_FILE)
+ SRC	= $(TST:%=%.c)
+ OBJ	= $(SRC:%.c=%.o)
+ DEP	= $(SRC:%.c=%.d)
+@@ -18,9 +30,12 @@ all:	$(TST)
+ install: all
+ .PHONY: all install
+ 
+-$(TST:%=%.pid):	%.pid:	%
++$(TST_NOFILE:%=%.pid):	%.pid:	%
+ 	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out
+ 
++$(TST_FILE:%=%.pid):	%.pid:	%
++	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --filename=$<.test
++
+ %.out:	%.pid %
+ 	-kill -TERM `cat $<`
+ 
+@@ -43,6 +58,8 @@ wait_stop:
+ 
+ $(TST):	| $(LIB)
+ 
++maps02: get_smaps_bits.o
++
+ %: %.sh
+ 	cp $< $@
+ 	chmod +x $@
+diff --git a/test/zdtm/customization/get_smaps_bits.c b/test/zdtm/customization/get_smaps_bits.c
+new file mode 100644
+index 0000000..9253f4d
+--- /dev/null
++++ b/test/zdtm/customization/get_smaps_bits.c
+@@ -0,0 +1,127 @@
++#include <string.h>
++#include <sys/mman.h>
++#include "zdtmtst.h"
++
++#ifndef MAP_HUGETLB
++# define MAP_HUGETLB 0x40000
++#endif
++
++#ifndef MADV_HUGEPAGE
++# define MADV_HUGEPAGE 14
++#endif
++
++#ifndef MADV_NOHUGEPAGE
++# define MADV_NOHUGEPAGE 15
++#endif
++
++#ifndef MADV_DONTDUMP
++# define MADV_DONTDUMP 16
++#endif
++
++static void parse_vmflags(char *buf, unsigned long *flags, unsigned long *madv)
++{
++	char *tok;
++
++	if (!buf[0])
++		return;
++
++	tok = strtok(buf, " \n");
++	if (!tok)
++		return;
++
++#define _vmflag_match(_t, _s) (_t[0] == _s[0] && _t[1] == _s[1])
++
++	do {
++		/* mmap() block */
++		if (_vmflag_match(tok, "gd"))
++			*flags |= MAP_GROWSDOWN;
++		else if (_vmflag_match(tok, "lo"))
++			*flags |= MAP_LOCKED;
++		else if (_vmflag_match(tok, "nr"))
++			*flags |= MAP_NORESERVE;
++		else if (_vmflag_match(tok, "ht"))
++			*flags |= MAP_HUGETLB;
++
++		/* madvise() block */
++		if (_vmflag_match(tok, "sr"))
++			*madv |= (1ul << MADV_SEQUENTIAL);
++		else if (_vmflag_match(tok, "rr"))
++			*madv |= (1ul << MADV_RANDOM);
++		else if (_vmflag_match(tok, "dc"))
++			*madv |= (1ul << MADV_DONTFORK);
++		else if (_vmflag_match(tok, "dd"))
++			*madv |= (1ul << MADV_DONTDUMP);
++		else if (_vmflag_match(tok, "mg"))
++			*madv |= (1ul << MADV_MERGEABLE);
++		else if (_vmflag_match(tok, "hg"))
++			*madv |= (1ul << MADV_HUGEPAGE);
++		else if (_vmflag_match(tok, "nh"))
++			*madv |= (1ul << MADV_NOHUGEPAGE);
++
++		/*
++		 * Anything else is just ignored.
++		 */
++	} while ((tok = strtok(NULL, " \n")));
++
++#undef _vmflag_match
++}
++
++#define is_hex_digit(c)				\
++	(((c) >= '0' && (c) <= '9')	||	\
++	 ((c) >= 'a' && (c) <= 'f')	||	\
++	 ((c) >= 'A' && (c) <= 'F'))
++
++static int is_vma_range_fmt(char *line, unsigned long *start, unsigned long *end)
++{
++	char *p = line;
++	while (*line && is_hex_digit(*line))
++		line++;
++
++	if (*line++ != '-')
++		return 0;
++
++	while (*line && is_hex_digit(*line))
++		line++;
++
++	if (*line++ != ' ')
++		return 0;
++
++	sscanf(p, "%lx-%lx", start, end);
++	return 1;
++}
++
++int get_smaps_bits(unsigned long where, unsigned long *flags, unsigned long *madv)
++{
++	unsigned long start = 0, end = 0;
++	FILE *smaps = NULL;
++	char buf[1024];
++	int found = 0;
++
++	if (!where)
++		return 0;
++
++	smaps = fopen("/proc/self/smaps", "r");
++	if (!smaps) {
++		pr_perror("Can't open smaps");
++		return -1;
++	}
++
++	while (fgets(buf, sizeof(buf), smaps)) {
++		is_vma_range_fmt(buf, &start, &end);
++
++		if (!strncmp(buf, "VmFlags: ", 9) && start == where) {
++			found = 1;
++			parse_vmflags(buf, flags, madv);
++			break;
++		}
++	}
++
++	fclose(smaps);
++
++	if (!found) {
++		pr_perror("VmFlags not found for %lx", where);
++		return -1;
++	}
++
++	return 0;
++}
+diff --git a/test/zdtm/customization/get_smaps_bits.h b/test/zdtm/customization/get_smaps_bits.h
+new file mode 100644
+index 0000000..ce1070d
+--- /dev/null
++++ b/test/zdtm/customization/get_smaps_bits.h
+@@ -0,0 +1,6 @@
++#ifndef ZDTM_GET_SMAPS_BITS_H_
++#define ZDTM_GET_SMAPS_BITS_H_
++
++extern int get_smaps_bits(unsigned long where, unsigned long *flags, unsigned long *madv);
++
++#endif /* ZDTM_GET_SMAPS_BITS_H_ */
+diff --git a/test/zdtm/customization/ipc.desc b/test/zdtm/customization/ipc.desc
+index 63df42a..4c127a0 100644
+--- a/test/zdtm/customization/ipc.desc
++++ b/test/zdtm/customization/ipc.desc
+@@ -1 +1 @@
+-{'flavor': 'h'}
++{'arch': 'aarch64', 'flavor': 'h'}
+diff --git a/test/zdtm/customization/maps00.c b/test/zdtm/customization/maps00.c
+new file mode 100644
+index 0000000..83533f8
+--- /dev/null
++++ b/test/zdtm/customization/maps00.c
+@@ -0,0 +1,271 @@
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <stdlib.h>
++#include <signal.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <setjmp.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include "zdtmtst.h"
++
++const char *test_doc	= "Create all sorts of maps and compare /proc/pid/maps\n"
++					   "before and after migration\n";
++const char *test_author	= "Pavel Emelianov <xemul@parallels.com>";
++
++char *filename;
++TEST_OPTION(filename, string, "file name", 1);
++
++const static int map_prots[] = {
++	PROT_NONE,
++	PROT_READ,
++	PROT_READ | PROT_WRITE,
++	PROT_READ | PROT_WRITE | PROT_EXEC,
++};
++#define NUM_MPROTS	sizeof(map_prots) / sizeof(int)
++#define RW_PROT(x)	((x) & (PROT_READ | PROT_WRITE))
++#define X_PROT(x)	((x) & PROT_EXEC)
++
++int check_prot(int src_prot, int dst_prot)
++{
++	if (RW_PROT(src_prot) != RW_PROT(dst_prot))
++		return 0;
++	/* If exec bit will be enabled may depend on NX capability of CPUs of
++	 * source and destination nodes. In any case, migrated mapping should
++	 * not have less permissions than newly created one
++	 **
++	 * A is a subset of B iff (A & B) == A
++	 */
++	 return (X_PROT(dst_prot) & X_PROT(src_prot)) == X_PROT(dst_prot);
++}
++
++const static int map_flags[] = {
++	MAP_PRIVATE,
++	MAP_SHARED,
++	MAP_PRIVATE | MAP_ANONYMOUS,
++	MAP_SHARED | MAP_ANONYMOUS
++};
++#define NUM_MFLAGS	sizeof(map_flags) / sizeof(int)
++#define NUM_MAPS	NUM_MPROTS * NUM_MFLAGS
++#define ONE_MAP_SIZE	0x2000
++
++struct map
++{
++	int prot;
++	int prot_real;
++	int flag;
++	char filename[256];
++	int fd;
++	void *ptr;
++};
++
++static void init_map(struct map *map, int prot_no, int flag_no)
++{
++	map->fd = -1;
++	map->prot = map_prots[prot_no];
++	map->flag = map_flags[flag_no];
++}
++
++static int make_map(struct map *map)
++{
++	uint32_t crc;
++	uint8_t buf[ONE_MAP_SIZE];
++	static int i = 0;
++
++	if (!(map->flag & MAP_ANONYMOUS)) {
++		/* need file */
++		if (snprintf(map->filename, sizeof(map->filename),
++					 "%s-%02d", filename, i++) >= sizeof(map->filename)) {
++			pr_perror("filename %s is too long", filename);
++			return -1;
++		}
++
++		map->fd = open(map->filename, O_RDWR | O_CREAT, 0600);
++		if (map->fd < 0) {
++			pr_perror("can't open %s", map->filename);
++			return -1;
++		}
++
++		crc = ~0;
++		datagen(buf, sizeof(buf), &crc);
++		if (write(map->fd, buf, sizeof(buf)) != sizeof(buf)) {
++			pr_perror("failed to write %s", map->filename);
++			return -1;
++		}
++	}
++
++	map->ptr = mmap(NULL, ONE_MAP_SIZE, map->prot, map->flag, map->fd, 0);
++	if (map->ptr == MAP_FAILED) {
++		pr_perror("can't create mapping");
++		return -1;
++	}
++
++	if ((map->flag & MAP_ANONYMOUS) && (map->prot & PROT_WRITE)) {
++		/* can't fill it with data otherwise */
++		crc = ~0;
++		datagen(map->ptr, ONE_MAP_SIZE, &crc);
++	}
++
++	test_msg("map: ptr %p flag %8x prot %8x\n",
++		 map->ptr, map->flag, map->prot);
++
++	return 0;
++}
++
++static sigjmp_buf segv_ret;		/* we need sig*jmp stuff, otherwise SIGSEGV will reset our handler */
++static void segfault(int signo)
++{
++	siglongjmp(segv_ret, 1);
++}
++
++/*
++ * after test func should be placed check map, because size of test_func
++ * is calculated as (check_map-test_func)
++ */
++int test_func(void)
++{
++	return 1;
++}
++static int check_map(struct map *map)
++{
++	int prot = PROT_WRITE | PROT_READ | PROT_EXEC;
++
++	if (signal(SIGSEGV, segfault) == SIG_ERR)
++	{
++		fail("setting SIGSEGV handler failed: %m\n");
++		return -1;
++	}
++	if (!sigsetjmp(segv_ret, 1))
++	{
++		uint32_t crc = ~0;
++		if (datachk(map->ptr, ONE_MAP_SIZE, &crc))	/* perform read access */
++			if (!(map->flag & MAP_ANONYMOUS) ||
++					(map->prot & PROT_WRITE)) {	/* anon maps could only be filled when r/w */
++				fail("CRC mismatch: ptr %p flag %8x prot %8x\n",
++				     map->ptr, map->flag, map->prot);
++				return -1;
++			}
++		/* prot |= PROT_READ//	need barrier before this line,
++					because compiler change order commands.
++					I finded one method: look at next lines*/
++	} else
++		prot &= PROT_WRITE | !PROT_READ | PROT_EXEC;
++
++	if (signal(SIGSEGV, segfault) == SIG_ERR)
++	{
++		fail("setting SIGSEGV handler failed: %m\n");
++		return -1;
++	}
++
++	if (!sigsetjmp(segv_ret, 1))
++	{
++		* (int *) (map->ptr) = 1234;	/* perform write access */
++	} else
++		prot &= !PROT_WRITE | PROT_READ | PROT_EXEC;
++
++	if (signal(SIGSEGV, segfault) == SIG_ERR)
++	{
++		fail("restoring SIGSEGV handler failed: %m\n");
++		return -1;
++	}
++
++	if (!sigsetjmp(segv_ret, 1))
++	{
++		if (map->prot & PROT_WRITE) {
++			memcpy(map->ptr,test_func, ONE_MAP_SIZE);
++			__builtin___clear_cache(map->ptr, map->ptr+ONE_MAP_SIZE);
++		} else {
++			if (!(map->flag & MAP_ANONYMOUS)) {
++				uint8_t funlen = (uint8_t *)check_map - (uint8_t *)test_func;
++				lseek(map->fd,0,SEEK_SET);
++				if (write(map->fd,test_func,funlen)<funlen) {
++					pr_perror("failed to write %s", map->filename);
++					return -1;
++				}
++			}
++		}
++		if (!(map->flag & MAP_ANONYMOUS) || (map->prot & PROT_WRITE)) {
++			/* Function body has been copied into the mapping */
++			((int (*)(void))map->ptr)();	/* perform exec access */
++		} else {
++			/* No way to copy function body into mapping,
++			 * clear exec bit from effective protection
++			 */
++			prot &= PROT_WRITE | PROT_READ | !PROT_EXEC;
++		}
++	} else
++		prot &= PROT_WRITE | PROT_READ | !PROT_EXEC;
++
++	if (signal(SIGSEGV, SIG_DFL) == SIG_ERR)
++	{
++		fail("restoring SIGSEGV handler failed: %m\n");
++		return -1;
++	}
++
++	return prot;
++}
++
++static void destroy_map(struct map *map)
++{
++	munmap(map->ptr, ONE_MAP_SIZE);
++
++	if (map->fd >= 0)
++	{
++		close(map->fd);
++		unlink(map->filename);
++	}
++}
++
++
++#define MAPS_LEN	0x10000
++
++int main(int argc, char ** argv)
++{
++	struct map maps[NUM_MAPS] = {}, maps_compare[NUM_MAPS] = {};
++	int i, j, k;
++	test_init(argc, argv);
++
++	k = 0;
++	for (i = 0; i < NUM_MPROTS; i++)
++		for (j = 0; j < NUM_MFLAGS; j++)
++			init_map(maps + k++, i, j);
++
++	for (i = 0; i < NUM_MAPS; i++)
++		if (make_map(maps + i))
++			goto err;
++
++	test_daemon();
++	test_waitsig();
++
++	for (i = 0; i < NUM_MAPS; i++)
++		if ((maps[i].prot_real=check_map(maps + i))<0)
++			goto err;
++	k=0;
++	for (i = 0; i < NUM_MPROTS; i++)
++		for (j = 0; j < NUM_MFLAGS; j++)
++			init_map(maps_compare + k++, i, j);
++	for (i = 0; i < NUM_MAPS; i++)
++		if (make_map(maps_compare+ i))
++			goto err;
++	for (i = 0; i < NUM_MAPS; i++)
++		if ((maps_compare[i].prot_real=check_map(maps_compare + i))<0)
++			goto err;
++	for (i = 0; i< NUM_MAPS; i++)
++		if (!check_prot(maps[i].prot_real, maps_compare[i].prot_real)){
++			fail("protection on %i (flag=%d prot=%d) maps has changed (prot=%d(expected %d))",
++				i, maps[i].flag, maps[i].prot, maps[i].prot_real, maps_compare[i].prot_real);
++			goto err;
++		}
++
++	pass();
++
++	for (i = 0; i < NUM_MAPS; i++) {
++		destroy_map(maps + i);
++		destroy_map(maps_compare + i);
++	}
++	return 0;
++
++err:
++	return 1;
++}
+diff --git a/test/zdtm/customization/maps00.desc b/test/zdtm/customization/maps00.desc
+new file mode 100644
+index 0000000..dad462e
+--- /dev/null
++++ b/test/zdtm/customization/maps00.desc
+@@ -0,0 +1 @@
++{'arch': 'aarch64', 'flavor': 'h', 'opts': '--pin-memory --use-fork-pid', 'flags': 'suid', 'cmdline': 'pinmemory max_pin_pid_num'}
+diff --git a/test/zdtm/customization/maps007.c b/test/zdtm/customization/maps007.c
+new file mode 100644
+index 0000000..ee5e7c7
+--- /dev/null
++++ b/test/zdtm/customization/maps007.c
+@@ -0,0 +1,178 @@
++
++#include <stdlib.h>
++#include <stdio.h>
++#include <unistd.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <signal.h>
++#include <sys/wait.h>
++#include <sys/uio.h>
++#include <asm/unistd.h>
++
++#include "zdtmtst.h"
++#include "lock.h"
++
++#define MAP_SIZE (1UL << 20)
++#define MEM_SIZE (1UL << 29)
++
++const char *test_doc	= "create random mappings and touch memory";
++
++int sys_process_vm_readv(pid_t pid, void *addr, void *buf, int size)
++{
++	struct iovec lvec = {.iov_base = buf, .iov_len = size };
++	struct iovec rvec = {.iov_base = addr, .iov_len = size };
++	/* workaround bug in glibc with sixth argument of syscall */
++	char nop[PAGE_SIZE];
++
++	memset(nop, 0, sizeof(nop));
++
++	return syscall(__NR_process_vm_readv, pid, &lvec, 1, &rvec, 1, 0);
++}
++
++/* The child follows the parents two steps behind. */
++#define MAX_DELTA 1000
++int main(int argc, char **argv)
++{
++	void *start, *end, *p;
++	pid_t child;
++	struct {
++		futex_t delta;
++		futex_t stop;
++	} *shm;
++	uint32_t v;
++	unsigned long long count = 0;
++	int i;
++
++	test_init(argc, argv);
++
++	/* shared memory for synchronization */
++	shm = mmap(NULL, PAGE_SIZE, PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
++	if (shm == MAP_FAILED)
++		return -1;
++
++	/* allocate workspace */
++	start = mmap(NULL, MEM_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	if (start == MAP_FAILED)
++		return -1;
++
++	test_msg("%p-%p\n", start, start + MEM_SIZE);
++
++	end = start + MEM_SIZE;
++
++	v = 0;
++	futex_set(&shm->delta, v);
++	futex_set(&shm->stop, 0);
++
++	child = fork();
++	if (child < 0) {
++		pr_perror("fork");
++		return 1;
++	}
++
++	while (1) {
++		void *ret;
++		unsigned long size;
++		int prot = PROT_NONE;
++
++		if (child) {
++			if (!test_go())
++				break;
++			futex_wait_while_gt(&shm->delta, 2 * MAX_DELTA);
++			futex_inc_and_wake(&shm->delta);
++		} else {
++			if (!futex_get(&shm->stop))
++				/* shm->delta must be always bigger than MAX_DELTA */
++				futex_wait_while_lt(&shm->delta, MAX_DELTA + 2);
++			else if (count % 100 == 0)
++				test_msg("count %llu delta %d\n",
++						count, futex_get(&shm->delta)); /* heartbeat */
++
++			if (futex_get(&shm->stop) && atomic_get(&shm->delta.raw) == MAX_DELTA)
++				break;
++			futex_dec_and_wake(&shm->delta);
++		}
++
++		count++;
++		if (child && count == MAX_DELTA + 1)
++			test_daemon();
++
++		p = start + ((lrand48() * PAGE_SIZE) % MEM_SIZE);
++		size = lrand48() * PAGE_SIZE;
++		size %= (end - p);
++		size %= MAP_SIZE;
++		if (size == 0)
++			size = PAGE_SIZE;
++
++		if (lrand48() % 2)
++			prot |= PROT_READ;
++		if (lrand48() % 2)
++			prot |= PROT_EXEC;
++		if (lrand48() % 2)
++			prot |= PROT_WRITE;
++
++		ret = mmap(p, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
++		if (ret == MAP_FAILED) {
++			pr_perror("%p-%p", p, p + size);
++			goto err;
++		}
++
++		if (!(prot & PROT_WRITE))
++			continue;
++
++		for (i = 0; i < lrand48() % 50; i++) {
++			char *t = p + (lrand48() * PAGE_SIZE) % (size);
++			t[0] = lrand48();
++		}
++	}
++	test_msg("count %llu\n", count);
++
++	if (child == 0) {
++		if (!test_go())
++			pr_perror("unexpected state");
++		futex_set_and_wake(&shm->stop, 2);
++		test_waitsig();
++		return 0;
++	} else {
++		int readable = 0, status = -1;
++
++		/* stop the child */
++		futex_set(&shm->stop, 1);
++		futex_add_and_wake(&shm->delta, MAX_DELTA);
++		/* wait until the child will be in the same point */
++		futex_wait_until(&shm->stop, 2);
++
++		/* check that child and parent have the identical content of memory */
++		for (p = start; p < end; p += PAGE_SIZE) {
++			char rbuf[PAGE_SIZE], lbuf[PAGE_SIZE];
++			int rret, lret;
++
++			lret = sys_process_vm_readv(getpid(), p, lbuf, PAGE_SIZE);
++			rret = sys_process_vm_readv(child, p, rbuf, PAGE_SIZE);
++			if (rret != lret) {
++				pr_perror("%p %d %d", p, lret, rret);
++				goto err;
++			}
++			if (lret < 0)
++				continue;
++			readable++;
++			if (memcmp(rbuf, lbuf, PAGE_SIZE)) {
++				pr_perror("%p", p);
++				goto err;
++			}
++		}
++		test_msg("readable %d\n", readable);
++		kill(child, SIGTERM);
++		wait(&status);
++		if (status != 0) {
++			pr_perror("Non-zero exit code: %d", status);
++			goto err;
++		}
++		pass();
++	}
++
++	return 0;
++err:
++	kill(child, SIGSEGV);
++	*((volatile int *) 0) = 0;
++	return 1;
++}
+diff --git a/test/zdtm/customization/maps007.desc b/test/zdtm/customization/maps007.desc
+new file mode 100644
+index 0000000..9ed7e46
+--- /dev/null
++++ b/test/zdtm/customization/maps007.desc
+@@ -0,0 +1 @@
++{'arch': 'aarch64', 'opts': '--pin-memory --use-fork-pid', 'flags': 'suid', 'flavor': 'h', 'cmdline': 'pinmemory max_pin_pid_num'}
+diff --git a/test/zdtm/customization/maps008.c b/test/zdtm/customization/maps008.c
+new file mode 100644
+index 0000000..7ed7c10
+--- /dev/null
++++ b/test/zdtm/customization/maps008.c
+@@ -0,0 +1,514 @@
++#include <stdlib.h>
++#include <stdbool.h>
++#include <string.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <signal.h>
++#include <sys/mman.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/wait.h>
++#include <linux/limits.h>
++#include "zdtmtst.h"
++#include "lock.h"
++
++const char *test_doc = "ps tree with anon shared vmas for dedup";
++
++/*
++ * 1. ps tree with non triavial anon shmem vmas is created first.
++ * 2. Each process gets its portion of shmem vmas.
++ * 3. Each process continuously datagens its portion until
++ *    criu dump is finished.
++ * 4. Each process datachecks all its shmem portions after restore.
++ * 5. Contents of anon shmem vmas are checked for equality in
++ *    different processes.
++ */
++
++typedef int (*proc_func_t)(task_waiter_t *setup_waiter);
++
++static pid_t fork_and_setup(proc_func_t pfunc)
++{
++	task_waiter_t setup_waiter;
++	pid_t pid;
++
++	task_waiter_init(&setup_waiter);
++	pid = test_fork();
++	if (pid < 0) {
++		pr_perror("fork failed");
++		exit(1);
++	}
++
++	if (pid == 0)
++		exit(pfunc(&setup_waiter));
++
++	task_waiter_wait4(&setup_waiter, pid);
++	task_waiter_fini(&setup_waiter);
++	return pid;
++}
++
++static void cont_and_wait_child(pid_t pid)
++{
++	int status;
++
++	kill(pid, SIGTERM);
++	waitpid(pid, &status, 0);
++	if (WIFEXITED(status)) {
++		if (WEXITSTATUS(status))
++			exit(WEXITSTATUS(status));
++	} else
++		exit(1);
++}
++
++static void *mmap_ashmem(size_t size)
++{
++	void *mem = mmap(NULL, size, PROT_WRITE | PROT_READ,
++			MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++	if (mem == MAP_FAILED) {
++		pr_perror("Can't map shmem %zx", size);
++		exit(1);
++	}
++	return mem;
++}
++
++static void *mmap_proc_mem(pid_t pid, unsigned long addr,
++		unsigned long size)
++{
++	int fd;
++	void *mem;
++	char path[PATH_MAX];
++
++	snprintf(path, PATH_MAX, "/proc/%d/map_files/%lx-%lx",
++			(int)pid, addr, addr + size);
++	fd = open(path, O_RDWR);
++	if (fd == -1) {
++		pr_perror("Can't open file %s", path);
++		exit(1);
++	}
++
++	mem = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
++	close(fd);
++	if (mem == MAP_FAILED) {
++		pr_perror("Can't map file %s", path);
++		exit(1);
++	}
++	return mem;
++}
++
++static void check_mem_eq(void *addr1, size_t size1, void *addr2, size_t size2)
++{
++	unsigned long min_size = size1 < size2 ? size1 : size2;
++
++	if (memcmp(addr1, addr2, min_size)) {
++		pr_err("Mem differs %lx %lx %lx", (unsigned long)addr1,
++			(unsigned long)addr2, min_size);
++		exit(1);
++	}
++}
++
++static void xmunmap(void *map, size_t size)
++{
++	if (munmap(map, size)) {
++		pr_err("xmunmap");
++		exit(1);
++	}
++}
++
++static void chk_proc_mem_eq(pid_t pid1, void *addr1, unsigned long size1,
++		pid_t pid2, void *addr2, unsigned long size2)
++{
++	void *map1, *map2;
++
++	map1 = mmap_proc_mem(pid1, (unsigned long)addr1, size1);
++	map2 = mmap_proc_mem(pid2, (unsigned long)addr2, size2);
++	check_mem_eq(map1, size1, map2, size2);
++	xmunmap(map1, size1);
++	xmunmap(map2, size2);
++}
++
++/*
++ * ps tree:
++ * proc1_______________
++ * |          |       |
++ * proc11___  proc12  proc13
++ * |       |          |
++ * proc111 proc112    proc131
++ */
++#define PROC_CNT 7
++
++#define PROC1_PGIX 0
++#define PROC11_PGIX 1
++#define PROC12_PGIX 2
++#define PROC13_PGIX 3
++#define PROC111_PGIX 4
++#define PROC112_PGIX 5
++#define PROC131_PGIX 6
++#define ZERO_PGIX 7
++/* unused pgix: 8 */
++#define MEM_PERIOD (9 * PAGE_SIZE)
++
++struct pstree {
++	pid_t proc1;
++	pid_t proc11;
++	pid_t proc12;
++	pid_t proc13;
++	pid_t proc111;
++	pid_t proc112;
++	pid_t proc131;
++};
++struct pstree *pstree;
++
++struct test_sync {
++	futex_t datagen;
++	futex_t datagen_exit_cnt;
++};
++struct test_sync *test_sync;
++
++size_t mem1_size, mem2_size, mem3_size;
++uint8_t *mem1, *mem2, *mem3;
++
++#define CRC_EPOCH_OFFSET (PAGE_SIZE - sizeof(uint32_t))
++
++static void read_each_pg(volatile uint8_t *mem, size_t size, size_t off)
++{
++	if (!mem)
++		return;
++
++	while (off < size) {
++		(mem + off)[0];
++		off += MEM_PERIOD;
++	}
++}
++
++void datagen_each_pg(uint8_t *mem, size_t size, size_t off, uint32_t crc_epoch)
++{
++	if (!mem)
++		return;
++
++	while (futex_get(&test_sync->datagen) && (off < size)) {
++		uint32_t crc = crc_epoch;
++
++		datagen(mem + off, CRC_EPOCH_OFFSET, &crc);
++		*(uint32_t *)(mem + off + CRC_EPOCH_OFFSET) = crc_epoch;
++		off += MEM_PERIOD;
++	}
++}
++
++void datachck_each_pg(uint8_t *mem, size_t size, size_t off)
++{
++	if (!mem)
++		return;
++
++	while (off < size) {
++		uint32_t crc = *(uint32_t *)(mem + off + CRC_EPOCH_OFFSET);
++
++		if (datachk(mem + off, CRC_EPOCH_OFFSET, &crc))
++			exit(1);
++		off += MEM_PERIOD;
++	}
++}
++
++static void mems_read_each_pgix(size_t pgix)
++{
++	const size_t off = pgix * PAGE_SIZE;
++
++	read_each_pg(mem1, mem1_size, off);
++	read_each_pg(mem2, mem2_size, off);
++	read_each_pg(mem3, mem3_size, off);
++}
++
++static void mems_datagen_each_pgix(size_t pgix, uint32_t *crc_epoch)
++{
++	const size_t off = pgix * PAGE_SIZE;
++
++	++(*crc_epoch);
++	datagen_each_pg(mem1, mem1_size, off, *crc_epoch);
++	datagen_each_pg(mem2, mem2_size, off, *crc_epoch);
++	datagen_each_pg(mem3, mem3_size, off, *crc_epoch);
++}
++
++static void mems_datachck_each_pgix(size_t pgix)
++{
++	const size_t off = pgix * PAGE_SIZE;
++
++	datachck_each_pg(mem1, mem1_size, off);
++	datachck_each_pg(mem2, mem2_size, off);
++	datachck_each_pg(mem3, mem3_size, off);
++}
++
++static int proc131_func(task_waiter_t *setup_waiter)
++{
++	uint32_t crc_epoch = 0;
++
++	pstree->proc131 = getpid();
++	mems_datagen_each_pgix(PROC131_PGIX, &crc_epoch);
++	task_waiter_complete_current(setup_waiter);
++
++	while (futex_get(&test_sync->datagen))
++		mems_datagen_each_pgix(PROC131_PGIX, &crc_epoch);
++	futex_inc_and_wake(&test_sync->datagen_exit_cnt);
++	test_waitsig();
++
++	mems_datachck_each_pgix(PROC131_PGIX);
++	return 0;
++}
++
++static int proc13_func(task_waiter_t *setup_waiter)
++{
++	size_t MEM1_HOLE_START = 2 * MEM_PERIOD;
++	size_t MEM1_HOLE_SIZE = 1 * MEM_PERIOD;
++	uint32_t crc_epoch = 0;
++
++	pstree->proc13 = getpid();
++	xmunmap(mem1 + MEM1_HOLE_START, MEM1_HOLE_SIZE);
++	xmunmap(mem2, mem2_size);
++	xmunmap(mem3, mem3_size);
++	mem2 = mem1 + MEM1_HOLE_START + MEM1_HOLE_SIZE;
++	mem2_size = mem1_size - (mem2 - mem1);
++	mem1_size = MEM1_HOLE_START;
++	mem3 = mmap_ashmem(mem3_size);
++	mems_datagen_each_pgix(PROC13_PGIX, &crc_epoch);
++	fork_and_setup(proc131_func);
++	task_waiter_complete_current(setup_waiter);
++
++	while (futex_get(&test_sync->datagen))
++		mems_datagen_each_pgix(PROC13_PGIX, &crc_epoch);
++	futex_inc_and_wake(&test_sync->datagen_exit_cnt);
++	test_waitsig();
++
++	mems_datachck_each_pgix(PROC13_PGIX);
++
++	chk_proc_mem_eq(pstree->proc13, mem1, mem1_size,
++		pstree->proc131, mem1, mem1_size);
++	chk_proc_mem_eq(pstree->proc13, mem2, mem2_size,
++		pstree->proc131, mem2, mem2_size);
++	chk_proc_mem_eq(pstree->proc13, mem3, mem3_size,
++		pstree->proc131, mem3, mem3_size);
++
++	cont_and_wait_child(pstree->proc131);
++	return 0;
++}
++
++static int proc12_func(task_waiter_t *setup_waiter)
++{
++	uint32_t crc_epoch = 0;
++
++	pstree->proc12 = getpid();
++	mems_datagen_each_pgix(PROC12_PGIX, &crc_epoch);
++	task_waiter_complete_current(setup_waiter);
++
++	while (futex_get(&test_sync->datagen))
++		mems_datagen_each_pgix(PROC12_PGIX, &crc_epoch);
++	futex_inc_and_wake(&test_sync->datagen_exit_cnt);
++	test_waitsig();
++
++	mems_datachck_each_pgix(PROC12_PGIX);
++
++	return 0;
++}
++
++static int proc111_func(task_waiter_t *setup_waiter)
++{
++	uint32_t crc_epoch = 0;
++
++	pstree->proc111 = getpid();
++	mems_datagen_each_pgix(PROC111_PGIX, &crc_epoch);
++	task_waiter_complete_current(setup_waiter);
++
++	while (futex_get(&test_sync->datagen))
++		mems_datagen_each_pgix(PROC111_PGIX, &crc_epoch);
++	futex_inc_and_wake(&test_sync->datagen_exit_cnt);
++	test_waitsig();
++
++	mems_datachck_each_pgix(PROC111_PGIX);
++	return 0;
++}
++
++static int proc112_func(task_waiter_t *setup_waiter)
++{
++	uint32_t crc_epoch = 0;
++
++	pstree->proc112 = getpid();
++	mems_datagen_each_pgix(PROC112_PGIX, &crc_epoch);
++	task_waiter_complete_current(setup_waiter);
++
++	while (futex_get(&test_sync->datagen))
++		mems_datagen_each_pgix(PROC112_PGIX, &crc_epoch);
++	futex_inc_and_wake(&test_sync->datagen_exit_cnt);
++	test_waitsig();
++
++	mems_datachck_each_pgix(PROC112_PGIX);
++	return 0;
++}
++
++static int proc11_func(task_waiter_t *setup_waiter)
++{
++	const size_t MEM3_START_CUT = 1 * MEM_PERIOD;
++	const size_t MEM3_END_CUT = 2 * MEM_PERIOD;
++	void *mem3_old = mem3;
++	size_t mem3_size_old = mem3_size;
++	uint32_t crc_epoch = 0;
++	uint8_t *proc1_mem3;
++
++	pstree->proc11 = getpid();
++	xmunmap(mem3, MEM3_START_CUT);
++	mem3 += MEM3_START_CUT;
++	mem3_size -= MEM3_START_CUT;
++	fork_and_setup(proc111_func);
++	fork_and_setup(proc112_func);
++	xmunmap(mem3 + mem3_size - MEM3_END_CUT, MEM3_END_CUT);
++	mem3_size -= MEM3_END_CUT;
++	mems_datagen_each_pgix(PROC11_PGIX, &crc_epoch);
++	task_waiter_complete_current(setup_waiter);
++
++	while (futex_get(&test_sync->datagen))
++		mems_datagen_each_pgix(PROC11_PGIX, &crc_epoch);
++	futex_inc_and_wake(&test_sync->datagen_exit_cnt);
++	test_waitsig();
++
++	mems_datachck_each_pgix(PROC11_PGIX);
++
++	chk_proc_mem_eq(pstree->proc11, mem1, mem1_size,
++		pstree->proc111, mem1, mem1_size);
++	chk_proc_mem_eq(pstree->proc11, mem1, mem1_size,
++		pstree->proc112, mem1, mem1_size);
++
++	chk_proc_mem_eq(pstree->proc11, mem2, mem2_size,
++		pstree->proc111, mem2, mem2_size);
++	chk_proc_mem_eq(pstree->proc11, mem2, mem2_size,
++		pstree->proc112, mem2, mem2_size);
++
++	chk_proc_mem_eq(pstree->proc11, mem3, mem3_size,
++		pstree->proc111, mem3, mem3_size + MEM3_END_CUT);
++	chk_proc_mem_eq(pstree->proc11, mem3, mem3_size,
++		pstree->proc112, mem3, mem3_size + MEM3_END_CUT);
++
++	proc1_mem3 = mmap_proc_mem(pstree->proc1,
++			(unsigned long)mem3_old, mem3_size_old);
++	check_mem_eq(mem3, mem3_size, proc1_mem3 + MEM3_START_CUT, mem3_size);
++	xmunmap(proc1_mem3, mem3_size_old);
++
++	cont_and_wait_child(pstree->proc111);
++	cont_and_wait_child(pstree->proc112);
++	return 0;
++}
++
++#define MAX(a, b) ((a) > (b) ? (a) : (b))
++#define MB(n) ((n) * (1UL << 20))
++
++static int proc1_func(void)
++{
++	uint32_t crc_epoch = 0;
++	uint8_t *mem2_old = NULL;
++
++	/*
++	 * Min mem size:
++	 * At least 5 mem periods for mem pages and vma holes.
++	 * At least 1 MB mem size not to test on tiny working set.
++	 */
++	mem1_size = MEM_PERIOD * MAX(5, MB(1) / MEM_PERIOD + 1);
++	mem2_size = mem1_size * 2;
++	mem3_size = mem2_size * 3;
++
++	futex_set(&test_sync->datagen, 1);
++	pstree->proc1 = getpid();
++	mem1 = mmap_ashmem(mem1_size);
++	mem2 = mmap_ashmem(mem2_size);
++	mem3 = mmap_ashmem(mem3_size);
++	mems_datagen_each_pgix(PROC1_PGIX, &crc_epoch);
++	mems_read_each_pgix(ZERO_PGIX);
++
++	fork_and_setup(proc11_func);
++	fork_and_setup(proc12_func);
++	fork_and_setup(proc13_func);
++
++	xmunmap(mem1, mem1_size);
++	if (mremap(mem2, mem2_size, mem1_size, MREMAP_MAYMOVE | MREMAP_FIXED,
++				mem1) != mem1) {
++		pr_perror("proc1 mem2 remap");
++		exit(1);
++	}
++	mem2_old = mem2;
++	mem2 = NULL;
++
++	test_daemon();
++	while (test_go())
++		mems_datagen_each_pgix(PROC1_PGIX, &crc_epoch);
++	test_waitsig();
++	futex_set(&test_sync->datagen_exit_cnt, 0);
++	futex_set(&test_sync->datagen, 0);
++	futex_wait_while(&test_sync->datagen_exit_cnt, PROC_CNT);
++
++	mems_datachck_each_pgix(PROC1_PGIX);
++
++	chk_proc_mem_eq(pstree->proc1, mem1, mem1_size,
++		pstree->proc11, mem2_old, mem2_size);
++	chk_proc_mem_eq(pstree->proc1, mem1, mem1_size,
++		pstree->proc12, mem2_old, mem2_size);
++
++	chk_proc_mem_eq(pstree->proc1, mem3, mem3_size,
++		pstree->proc12, mem3, mem3_size);
++
++	cont_and_wait_child(pstree->proc11);
++	cont_and_wait_child(pstree->proc12);
++	cont_and_wait_child(pstree->proc13);
++
++	pass();
++	return 0;
++}
++
++static void kill_pstree_from_root(void)
++{
++	if (getpid() != pstree->proc1)
++		return;
++
++	kill(pstree->proc11, SIGKILL);
++	kill(pstree->proc12, SIGKILL);
++	kill(pstree->proc13, SIGKILL);
++	kill(pstree->proc111, SIGKILL);
++	kill(pstree->proc112, SIGKILL);
++	kill(pstree->proc131, SIGKILL);
++}
++
++static void sigchld_hand(int signo, siginfo_t *info, void *ucontext)
++{
++	if (info->si_code != CLD_EXITED)
++		return;
++	if (!info->si_status)
++		return;
++
++	/*
++	 * If we are not ps tree root then propagate child error to parent.
++	 * If we are ps tree root then also call all
++	 * atexit handlers set up by zdtm test framework and this test.
++	 * exit() is not async signal safe but it's ok for testing purposes.
++	 * exit() usage allows us to use very simple error handling
++	 * and pstree killing logic.
++	 */
++	exit(info->si_status);
++}
++
++int main(int argc, char **argv)
++{
++	struct sigaction sa = {
++		.sa_sigaction = sigchld_hand,
++		.sa_flags = SA_RESTART | SA_SIGINFO | SA_NOCLDSTOP
++	};
++	sigemptyset(&sa.sa_mask);
++
++	test_init(argc, argv);
++
++	pstree = (struct pstree *)mmap_ashmem(PAGE_SIZE);
++	test_sync = (struct test_sync *)mmap_ashmem(sizeof(*test_sync));
++
++	if (sigaction(SIGCHLD, &sa, NULL)) {
++		pr_perror("SIGCHLD handler setup");
++		exit(1);
++	};
++
++	if (atexit(kill_pstree_from_root)) {
++		pr_err("Can't setup atexit cleanup func");
++		exit(1);
++	}
++	return proc1_func();
++}
+diff --git a/test/zdtm/customization/maps008.desc b/test/zdtm/customization/maps008.desc
+new file mode 100644
+index 0000000..154ef8c
+--- /dev/null
++++ b/test/zdtm/customization/maps008.desc
+@@ -0,0 +1 @@
++{'arch': 'aarch64', 'opts': '--pin-memory --use-fork-pid', 'flavor': 'h', 'flags': 'suid', 'cmdline': 'pinmemory max_pin_pid_num'}
+diff --git a/test/zdtm/customization/maps01.c b/test/zdtm/customization/maps01.c
+new file mode 100644
+index 0000000..119d7a6
+--- /dev/null
++++ b/test/zdtm/customization/maps01.c
+@@ -0,0 +1,183 @@
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <stdlib.h>
++#include <signal.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/wait.h>
++#include <linux/limits.h>
++#include "zdtmtst.h"
++
++#define MEM_SIZE (1LU << 30)
++#define MEM_OFFSET (1LU << 29)
++#define MEM_OFFSET2 (MEM_SIZE - PAGE_SIZE)
++#define MEM_OFFSET3 (20LU * PAGE_SIZE)
++
++const char *test_doc	= "Test shared memory";
++const char *test_author	= "Andrew Vagin <avagin@openvz.org";
++
++int main(int argc, char ** argv)
++{
++	void *m, *m2, *p, *p2;
++	char path[PATH_MAX];
++	uint32_t crc;
++	pid_t pid = -1;
++	int status, fd;
++	task_waiter_t t;
++
++	test_init(argc, argv);
++
++	task_waiter_init(&t);
++
++	m = mmap(NULL, MEM_SIZE, PROT_WRITE | PROT_READ,
++				MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++
++	if (m == MAP_FAILED) {
++		pr_err("Failed to mmap %lu Mb shared anonymous R/W memory\n",
++				MEM_SIZE >> 20);
++		goto err;
++	}
++
++	p = mmap(NULL, MEM_SIZE, PROT_WRITE | PROT_READ,
++				MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++
++	if (p == MAP_FAILED) {
++		pr_err("Failed to mmap %ld Mb shared anonymous R/W memory\n",
++				MEM_SIZE >> 20);
++		goto err;
++	}
++
++	p2 = mmap(NULL, MEM_OFFSET, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	if (p2 == MAP_FAILED) {
++		pr_err("Failed to mmap %lu Mb anonymous memory\n",
++				MEM_OFFSET >> 20);
++		goto err;
++	}
++
++	pid = test_fork();
++	if (pid < 0) {
++		pr_err("Fork failed with %d\n", pid);
++		goto err;
++	} else if (pid == 0) {
++		void *p3;
++
++		p3 = mmap(NULL, MEM_OFFSET3, PROT_READ | PROT_WRITE,
++					MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++		if (p3 == MAP_FAILED) {
++			pr_err("Failed to mmap %lu Mb anonymous R/W memory\n",
++					MEM_OFFSET3 >> 20);
++			goto err;
++		}
++
++		crc = ~0;
++		datagen(m + MEM_OFFSET, PAGE_SIZE, &crc);
++		crc = ~0;
++		datagen(m + MEM_OFFSET2, PAGE_SIZE, &crc);
++		crc = ~0;
++		datagen(p + MEM_OFFSET + MEM_OFFSET3, PAGE_SIZE, &crc);
++		crc = ~0;
++		datagen(p + MEM_OFFSET + 2 * MEM_OFFSET3, PAGE_SIZE, &crc);
++		crc = ~0;
++		datagen(p + MEM_OFFSET3, PAGE_SIZE, &crc);
++		crc = ~0;
++		datagen(p3, PAGE_SIZE, &crc);
++
++		task_waiter_complete(&t, 1);
++
++		test_waitsig();
++
++		crc = ~0;
++		status = datachk(m + MEM_OFFSET, PAGE_SIZE, &crc);
++		if (status)
++			return 1;
++		crc = ~0;
++		status = datachk(m + MEM_OFFSET2, PAGE_SIZE, &crc);
++		if (status)
++			return 1;
++		crc = ~0;
++		status = datachk(m + PAGE_SIZE, PAGE_SIZE, &crc);
++		if (status)
++			return 1;
++		crc = ~0;
++		status = datachk(p + MEM_OFFSET + 2 * MEM_OFFSET3, PAGE_SIZE, &crc);
++		if (status)
++			return 1;
++		crc = ~0;
++		status = datachk(p + MEM_OFFSET3, PAGE_SIZE, &crc);
++		if (status)
++			return 1;
++		crc = ~0;
++		status = datachk(p3, PAGE_SIZE, &crc);
++		if (status)
++			return 1;
++		return 0;
++	}
++	task_waiter_wait4(&t, 1);
++
++	munmap(p, MEM_OFFSET);
++	p2 = mremap(p + MEM_OFFSET, MEM_OFFSET, MEM_OFFSET, MREMAP_FIXED | MREMAP_MAYMOVE, p2);
++	if (p2 == MAP_FAILED)
++		goto err;
++
++	snprintf(path, PATH_MAX, "/proc/self/map_files/%lx-%lx",
++						(unsigned long) m,
++						(unsigned long) m + MEM_SIZE);
++	fd = open(path, O_RDWR);
++	if (fd == -1) {
++		pr_perror("Can't open file %s", path);
++		goto err;
++	}
++
++	m2 = mmap(NULL, PAGE_SIZE, PROT_WRITE | PROT_READ, MAP_SHARED, fd, MEM_OFFSET3);
++	if (m2 == MAP_FAILED) {
++		pr_perror("Can't map file %s", path);
++		goto err;
++	}
++	close(fd);
++
++	munmap(m, PAGE_SIZE);
++	munmap(m + PAGE_SIZE * 10, PAGE_SIZE);
++	munmap(m + MEM_OFFSET2, PAGE_SIZE);
++
++	crc = ~0;
++	datagen(m + PAGE_SIZE, PAGE_SIZE, &crc);
++
++	crc = ~0;
++	datagen(m2, PAGE_SIZE, &crc);
++
++	test_daemon();
++	test_waitsig();
++
++	kill(pid, SIGTERM);
++	wait(&status);
++	if (WIFEXITED(status)) {
++		if (WEXITSTATUS(status))
++			goto err;
++	} else
++		goto err;
++
++	crc = ~0;
++	if (datachk(m + MEM_OFFSET, PAGE_SIZE, &crc))
++		goto err;
++
++	crc = ~0;
++	if (datachk(m2, PAGE_SIZE, &crc))
++		goto err;
++
++	crc = ~0;
++	if (datachk(p2 + MEM_OFFSET3, PAGE_SIZE, &crc))
++		goto err;
++
++	pass();
++
++	return 0;
++err:
++	if (waitpid(-1, NULL, WNOHANG) == 0) {
++		kill(pid, SIGTERM);
++		wait(NULL);
++	}
++	return 1;
++}
+diff --git a/test/zdtm/customization/maps01.desc b/test/zdtm/customization/maps01.desc
+new file mode 100644
+index 0000000..dad462e
+--- /dev/null
++++ b/test/zdtm/customization/maps01.desc
+@@ -0,0 +1 @@
++{'arch': 'aarch64', 'flavor': 'h', 'opts': '--pin-memory --use-fork-pid', 'flags': 'suid', 'cmdline': 'pinmemory max_pin_pid_num'}
+diff --git a/test/zdtm/customization/maps02.c b/test/zdtm/customization/maps02.c
+new file mode 100644
+index 0000000..eb7c09b
+--- /dev/null
++++ b/test/zdtm/customization/maps02.c
+@@ -0,0 +1,111 @@
++#include <sys/mman.h>
++#include "zdtmtst.h"
++#include "get_smaps_bits.h"
++
++#ifndef MADV_DONTDUMP
++#define MADV_DONTDUMP   16
++#endif
++
++const char *test_doc	= "Test shared memory with advises";
++const char *test_author	= "Cyrill Gorcunov <gorcunov@openvz.org>";
++
++struct mmap_data {
++	void		*start;
++	unsigned long	orig_flags;
++	unsigned long	orig_madv;
++	unsigned long	new_flags;
++	unsigned long	new_madv;
++};
++
++#define MEM_SIZE (8192)
++
++static int alloc_anon_mmap(struct mmap_data *m, int flags, int adv)
++{
++	m->start = mmap(NULL, MEM_SIZE, PROT_READ | PROT_WRITE,
++			flags, -1, 0);
++	if (m->start == MAP_FAILED) {
++		pr_perror("mmap failed");
++		return -1;
++	}
++
++	if (madvise(m->start, MEM_SIZE, adv)) {
++		if (errno == EINVAL) {
++			test_msg("madvise failed, no kernel support\n");
++			munmap(m->start, MEM_SIZE);
++			*m = (struct mmap_data){ };
++		} else {
++			pr_perror("madvise failed");
++			return -1;
++		}
++	}
++
++	return 0;
++}
++
++int main(int argc, char **argv)
++{
++	struct mmap_data m[5] = { };
++	size_t i;
++
++	test_init(argc, argv);
++
++	test_msg("Alloc growsdown\n");
++	if (alloc_anon_mmap(&m[0], MAP_PRIVATE | MAP_ANONYMOUS, MADV_DONTFORK))
++		return -1;
++
++	test_msg("Alloc locked/sequential\n");
++	if (alloc_anon_mmap(&m[1], MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED, MADV_SEQUENTIAL))
++		return -1;
++
++	test_msg("Alloc noreserve/dontdump\n");
++	if (alloc_anon_mmap(&m[2], MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, MADV_DONTDUMP))
++		return -1;
++
++	test_msg("Alloc hugetlb/hugepage\n");
++	if (alloc_anon_mmap(&m[3], MAP_PRIVATE | MAP_ANONYMOUS, MADV_HUGEPAGE))
++		return -1;
++
++	test_msg("Alloc dontfork/random|mergeable\n");
++	if (alloc_anon_mmap(&m[4], MAP_PRIVATE | MAP_ANONYMOUS, MADV_MERGEABLE))
++		return -1;
++
++	test_msg("Fetch existing flags/adv\n");
++	for (i = 0; i < sizeof(m)/sizeof(m[0]); i++) {
++		if (get_smaps_bits((unsigned long)m[i].start,
++				   &m[i].orig_flags,
++				   &m[i].orig_madv))
++			return -1;
++	}
++
++	test_daemon();
++	test_waitsig();
++
++	test_msg("Fetch restored flags/adv\n");
++	for (i = 0; i < sizeof(m)/sizeof(m[0]); i++) {
++		if (get_smaps_bits((unsigned long)m[i].start,
++				   &m[i].new_flags,
++				   &m[i].new_madv))
++			return -1;
++
++		if (m[i].orig_flags != m[i].new_flags) {
++			pr_perror("Flags are changed %lx %lx -> %lx (%zu)",
++			    (unsigned long)m[i].start,
++			    m[i].orig_flags, m[i].new_flags, i);
++			fail();
++			return -1;
++		}
++
++		if (m[i].orig_madv != m[i].new_madv) {
++			pr_perror("Madvs are changed %lx %lx -> %lx (%zu)",
++			    (unsigned long)m[i].start,
++			    m[i].orig_madv, m[i].new_madv, i);
++			fail();
++			return -1;
++		}
++
++	}
++
++	pass();
++
++	return 0;
++}
+diff --git a/test/zdtm/customization/maps02.desc b/test/zdtm/customization/maps02.desc
+new file mode 100644
+index 0000000..f14d661
+--- /dev/null
++++ b/test/zdtm/customization/maps02.desc
+@@ -0,0 +1 @@
++{'arch': 'aarch64', 'opts': '--pin-memory --use-fork-pid', 'flavor': 'h', 'cmdline': 'pinmemory max_pin_pid_num'}
+diff --git a/test/zdtm/customization/maps04.c b/test/zdtm/customization/maps04.c
+new file mode 100644
+index 0000000..780c566
+--- /dev/null
++++ b/test/zdtm/customization/maps04.c
+@@ -0,0 +1,57 @@
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <stdlib.h>
++#include <signal.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/wait.h>
++#include <linux/limits.h>
++#include "zdtmtst.h"
++
++#define MEM_SIZE (1L << 29)
++
++const char *test_doc	= "Test big mappings";
++const char *test_author	= "Andrew Vagin <avagin@openvz.org";
++
++int main(int argc, char ** argv)
++{
++	void *m;
++	uint32_t crc;
++	int i;
++
++	test_init(argc, argv);
++
++	m = mmap(NULL, MEM_SIZE, PROT_WRITE | PROT_READ,
++				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++
++	if (m == MAP_FAILED) {
++		fail();
++		return 1;
++	}
++
++	crc = ~0;
++	datagen(m, MEM_SIZE, &crc);
++
++	for (i = 0; i < MEM_SIZE / (1<<20); i++)
++		if (mprotect(m + (lrand48() * PAGE_SIZE % MEM_SIZE), PAGE_SIZE, PROT_NONE)) {
++			pr_perror("mprotect");
++			return 1;
++		}
++
++	test_daemon();
++	test_waitsig();
++
++	if (mprotect(m, MEM_SIZE, PROT_READ))
++		pr_perror("mprotect");
++
++	crc = ~0;
++	if (datachk(m, MEM_SIZE, &crc))
++		fail("Mem corrupted");
++	else
++		pass();
++
++	return 0;
++}
+diff --git a/test/zdtm/customization/maps04.desc b/test/zdtm/customization/maps04.desc
+new file mode 100644
+index 0000000..2db7603
+--- /dev/null
++++ b/test/zdtm/customization/maps04.desc
+@@ -0,0 +1 @@
++{'arch': 'aarch64', 'opts': '--pin-memory --use-fork-pid', 'flavor': 'h', 'timeout': '60', 'cmdline': 'pinmemory max_pin_pid_num'}
+diff --git a/test/zdtm/customization/maps05.c b/test/zdtm/customization/maps05.c
+new file mode 100644
+index 0000000..faa09ee
+--- /dev/null
++++ b/test/zdtm/customization/maps05.c
+@@ -0,0 +1,91 @@
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <stdlib.h>
++#include <signal.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <setjmp.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include "zdtmtst.h"
++
++const char *test_doc	= "Create a bunch of small VMAs and test they survive transferring\n";
++const char *test_author	= "Cyrill Gorcunov <gorcunov@openvz.org>";
++
++#define NR_MAPS		4096
++
++#define NR_MAPS_1	(NR_MAPS + 0)
++#define NR_MAPS_2	(NR_MAPS + 1)
++
++#define MAPS_SIZE_1	(140 << 10)
++#define MAPS_SIZE_2	(8192)
++
++int main(int argc, char *argv[])
++{
++	void *map[NR_MAPS + 2] = { }, *addr;
++	size_t i, summary;
++
++	test_init(argc, argv);
++
++	summary = NR_MAPS * 2 * 4096 + MAPS_SIZE_1 + MAPS_SIZE_2 + (1 << 20);
++
++	addr = mmap(NULL, summary, PROT_NONE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
++	if (addr == MAP_FAILED) {
++		pr_perror("Can't mmap");
++		return 1;
++	}
++	munmap(addr, summary);
++
++	for (i = 0; i < NR_MAPS; i++) {
++		map[i] = mmap(i > 0 ? map[i - 1] + 8192 : addr, 4096, PROT_READ | PROT_WRITE,
++			      MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
++		if (map[i] == MAP_FAILED) {
++			pr_perror("Can't mmap");
++			return 1;
++		} else {
++			/* Dirtify it */
++			int *v = (void *)map[i];
++			*v = i;
++		}
++	}
++
++	map[NR_MAPS_1] = mmap(map[NR_MAPS_1 - 1] + 8192, MAPS_SIZE_1, PROT_READ | PROT_WRITE | PROT_EXEC,
++			      MAP_ANONYMOUS | MAP_PRIVATE | MAP_GROWSDOWN, -1, 0);
++	if (map[NR_MAPS_1] == MAP_FAILED) {
++		pr_perror("Can't mmap");
++		return 1;
++	} else {
++		/* Dirtify it */
++		int *v = (void *)map[NR_MAPS_1];
++		*v = i;
++		test_msg("map-1: %p %p\n", map[NR_MAPS_1], map[NR_MAPS_1] + MAPS_SIZE_1);
++	}
++
++	map[NR_MAPS_2] = mmap(map[NR_MAPS_1] + MAPS_SIZE_1, MAPS_SIZE_2, PROT_READ | PROT_WRITE,
++			      MAP_ANONYMOUS | MAP_PRIVATE | MAP_GROWSDOWN, -1, 0);
++	if (map[NR_MAPS_2] == MAP_FAILED) {
++		pr_perror("Can't mmap");
++		return 1;
++	} else {
++		/* Dirtify it */
++		int *v = (void *)map[NR_MAPS_2];
++		*v = i;
++		test_msg("map-2: %p %p\n", map[NR_MAPS_2], map[NR_MAPS_2] + MAPS_SIZE_2);
++	}
++
++	test_daemon();
++	test_waitsig();
++
++	for (i = 0; i < NR_MAPS; i++) {
++		int *v = (void *)map[i];
++
++		if (*v != i) {
++			fail("Data corrupted at page %lu", (unsigned long)i);
++			return 1;
++		}
++	}
++
++	pass();
++	return 0;
++}
+diff --git a/test/zdtm/customization/maps05.desc b/test/zdtm/customization/maps05.desc
+new file mode 100644
+index 0000000..f14d661
+--- /dev/null
++++ b/test/zdtm/customization/maps05.desc
+@@ -0,0 +1 @@
++{'arch': 'aarch64', 'opts': '--pin-memory --use-fork-pid', 'flavor': 'h', 'cmdline': 'pinmemory max_pin_pid_num'}
+diff --git a/test/zdtm/customization/maps06.c b/test/zdtm/customization/maps06.c
+new file mode 100644
+index 0000000..7480d6b
+--- /dev/null
++++ b/test/zdtm/customization/maps06.c
+@@ -0,0 +1,70 @@
++#include "zdtmtst.h"
++#include <sys/mman.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++
++const char *test_doc	= "Create a lot of file vma-s";
++const char *test_author	= "Andrei Vagin <avagin@openvz.org>";
++
++char *filename;
++TEST_OPTION(filename, string, "file name", 1);
++
++int main(int argc, char ** argv)
++{
++	void *start;
++	int fd, i;
++	int ps = sysconf(_SC_PAGESIZE);
++	int test_size;
++
++	test_init(argc, argv);
++
++	fd = open(filename, O_RDWR | O_CREAT, 0666);
++	if (fd < 0)
++		return 1;
++
++	ftruncate(fd, ps);
++
++	if (ps == 0x1000)
++		test_size = 10240;
++	else
++		test_size = 512;
++
++	start = mmap(0, ps * test_size * 4, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
++	if (start == MAP_FAILED)
++		return 1;
++
++	for (i = 0; i < test_size; i++) {
++		int *addr;
++		addr = mmap(start + i * 3 * ps, ps,
++				PROT_READ | PROT_WRITE,
++				MAP_PRIVATE | MAP_FILE | MAP_FIXED, fd, 0);
++		if (addr == MAP_FAILED)
++			return 1;
++		addr[0] = i * 2;
++		addr = mmap(start + (i * 3 + 1) * ps, ps,
++				PROT_READ | PROT_WRITE,
++				MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
++		if (addr == MAP_FAILED)
++			return 1;
++		addr[0] = i;
++	}
++
++	test_daemon();
++
++	test_waitsig();
++
++	for (i = 0; i < test_size; i++) {
++		int *addr;
++		addr = start + i * 3 * ps;
++		if (addr[0] != i * 2)
++			fail();
++		addr = start + (i * 3  + 1) * ps;
++		if (addr[0] != i)
++			fail();
++	}
++
++	pass();
++
++	return 0;
++}
+diff --git a/test/zdtm/customization/maps06.desc b/test/zdtm/customization/maps06.desc
+new file mode 100644
+index 0000000..f14d661
+--- /dev/null
++++ b/test/zdtm/customization/maps06.desc
+@@ -0,0 +1 @@
++{'arch': 'aarch64', 'opts': '--pin-memory --use-fork-pid', 'flavor': 'h', 'cmdline': 'pinmemory max_pin_pid_num'}
+diff --git a/test/zdtm/customization/maps_file_prot.c b/test/zdtm/customization/maps_file_prot.c
+new file mode 100644
+index 0000000..3b28c1f
+--- /dev/null
++++ b/test/zdtm/customization/maps_file_prot.c
+@@ -0,0 +1,53 @@
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <linux/limits.h>
++#include "zdtmtst.h"
++
++const char *test_doc	= "Test mappings of same file with different prot";
++const char *test_author	= "Jamie Liu <jamieliu@google.com>";
++
++char *filename;
++TEST_OPTION(filename, string, "file name", 1);
++
++#define die(fmt, arg...) do { pr_perror(fmt, ## arg); return 1; } while (0)
++
++int main(int argc, char ** argv)
++{
++	void *ro_map, *rw_map;
++	int fd;
++
++	test_init(argc, argv);
++
++	fd = open(filename, O_RDWR | O_CREAT, 0644);
++	if (fd < 0)
++		die("open failed");
++	if (ftruncate(fd, 2 * PAGE_SIZE))
++		die("ftruncate failed");
++
++	ro_map = mmap(NULL, 2 * PAGE_SIZE, PROT_READ, MAP_SHARED, fd, 0);
++	if (ro_map == MAP_FAILED)
++		die("mmap failed");
++	rw_map = ro_map + PAGE_SIZE;
++	if (mprotect(rw_map, PAGE_SIZE, PROT_READ | PROT_WRITE))
++		die("mprotect failed");
++
++	close(fd);
++
++	test_daemon();
++	test_waitsig();
++
++	/* Check that rw_map is still writeable */
++	*(volatile char *)rw_map = 1;
++
++	if (mprotect(ro_map, PAGE_SIZE, PROT_READ | PROT_WRITE)) {
++		fail("mprotect after restore failed");
++		return 1;
++	}
++
++	pass();
++	return 0;
++}
+diff --git a/test/zdtm/customization/maps_file_prot.desc b/test/zdtm/customization/maps_file_prot.desc
+new file mode 100644
+index 0000000..0ec4023
+--- /dev/null
++++ b/test/zdtm/customization/maps_file_prot.desc
+@@ -0,0 +1 @@
++{'arch': 'aarch64', 'opts': '--pin-memory --use-fork-pid', 'flavor': 'h'}
+diff --git a/test/zdtm_ct.c b/test/zdtm_ct.c
+index e8d45a9..3bbd3a3 100644
+--- a/test/zdtm_ct.c
++++ b/test/zdtm_ct.c
+@@ -9,6 +9,7 @@
+ #include <sys/stat.h>
+ #include <fcntl.h>
+ #include <errno.h>
++#include <string.h>
+ #include <sys/utsname.h>
+ 
+ #ifndef CLONE_NEWTIME
+@@ -95,13 +96,23 @@ int main(int argc, char **argv)
+ {
+ 	pid_t pid;
+ 	int status;
++	char *val = getenv("ZDTM_NO_PID_NS");
++	int flags = CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWIPC;
++
++	/*
++	 * Some customizing mechanism don't support pid namespace,
++	 * so every customizing feature testcase will set
++	 * 'ZDTM_NO_PID_NS' environment value.
++	 */
++	if (val == NULL || strcmp(val, "1") != 0)
++		flags |= CLONE_NEWPID;
+ 
+ 	/*
+ 	 * pidns is used to avoid conflicts
+ 	 * mntns is used to mount /proc
+ 	 * net is used to avoid conflicts of parasite sockets
+ 	 */
+-	if (unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWIPC))
++	if (unshare(flags))
+ 		return 1;
+ 	pid = fork();
+ 	if (pid == 0) {
+-- 
+2.34.1
+

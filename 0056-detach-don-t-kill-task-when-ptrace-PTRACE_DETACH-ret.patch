@@ -1,0 +1,38 @@
+From 389a410ddfbca241bf724a4e4751fa96499ff6f1 Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Thu, 30 Dec 2021 10:45:16 +0800
+Subject: [PATCH 56/72] detach: don't kill task when `ptrace(PTRACE_DETACH)`
+ return ESRCH
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/26
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/cr-restore.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/criu/cr-restore.c b/criu/cr-restore.c
+index 13f0a93..c3ff65d 100644
+--- a/criu/cr-restore.c
++++ b/criu/cr-restore.c
+@@ -2317,6 +2317,16 @@ static int finalize_restore_detach(void)
+ 				return -1;
+ 			}
+ 			if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
++				/*
++				 * There is delta between task resume and
++				 * `ptrace(PTRACE_DETACH)`, task maybe exit
++				 * initiative during this time.
++				 */
++				if (errno == ESRCH) {
++					pr_warn("Unable to detach %d, task has dead\n", pid);
++					continue;
++				}
++
+ 				pr_perror("Unable to detach %d", pid);
+ 				return -1;
+ 			}
+-- 
+2.34.1
+

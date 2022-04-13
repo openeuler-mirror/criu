@@ -1,0 +1,620 @@
+From 8c7cfce7c9f90af9314b96c6ec34c97fb6f9be8a Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Mon, 14 Feb 2022 19:11:15 +0800
+Subject: [PATCH 64/72] zdtm: init notifier testcase
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ test/zdtm.py                            |  70 ++++++++--
+ test/zdtm/customization/Makefile        |   3 +-
+ test/zdtm/customization/notifier00.c    |  68 ++++++++++
+ test/zdtm/customization/notifier00.desc |   1 +
+ test/zdtm/mod/.gitignore                | 163 ++++++++++++++++++++++++
+ test/zdtm/mod/Makefile                  |  28 ++++
+ test/zdtm/mod/notifier.c                | 145 +++++++++++++++++++++
+ 7 files changed, 466 insertions(+), 12 deletions(-)
+ create mode 100644 test/zdtm/customization/notifier00.c
+ create mode 100644 test/zdtm/customization/notifier00.desc
+ create mode 100644 test/zdtm/mod/.gitignore
+ create mode 100644 test/zdtm/mod/Makefile
+ create mode 100644 test/zdtm/mod/notifier.c
+
+diff --git a/test/zdtm.py b/test/zdtm.py
+index d3b146f..d64a683 100755
+--- a/test/zdtm.py
++++ b/test/zdtm.py
+@@ -25,6 +25,7 @@ import tempfile
+ import time
+ import socket
+ import pathlib
++import platform
+ from builtins import (input, int, open, range, str, zip)
+ 
+ import pycriu as crpc
+@@ -1466,6 +1467,13 @@ class criu:
+                 return True
+         return False
+ 
++    @staticmethod
++    def check_sysfs(pathes):
++        for path in pathes.split():
++            if not pathlib.Path(path).exists():
++                return True
++        return False
++
+     @staticmethod
+     def available():
+         if not os.access(opts['criu_bin'], os.X_OK):
+@@ -1991,21 +1999,49 @@ class Launcher:
+             testline = u"ok %d - %s # SKIP %s" % (self.__runtest, name, reason)
+             print(testline, file=self.__file_report)
+ 
++    def check_module(self, mod):
++        found = False
++        with open("/proc/modules") as f:
++            for line in f.readlines():
++                if "pin_memory" == line.split()[0]:
++                    found = True
++        return found
++
+     def modprobe_pin_memory(self, load):
++        mod = "pin_memory"
+         if not load:
+             return
+-        else:
+-            found = False
+-            with open("/proc/modules") as f:
+-                for line in f.readlines():
+-                    if "pin_memory" == line.split()[0]:
+-                        found = True
+-            if not found:
+-                subprocess.check_call(["modprobe", "pin_memory"])
++        elif not self.check_module(mod):
++            subprocess.check_call(["modprobe", mod])
+ 
+             cmd = [opts["criu_bin"], "init-pagemap-read"]
+             subprocess.check_call(cmd, shell=False)
+ 
++    def build_and_load_mod(self, target, kdir):
++        if platform.machine() != "aarch64" or not target:
++            return
++
++        if not os.access("zdtm/mod", os.R_OK):
++            print("should be executed in the test subdir")
++            sys.exit(0)
++
++        dirpath = f"MOD={os.getcwd()}/zdtm/mod"
++        build_mod = ["make", "-C", "zdtm/mod", dirpath, target]
++        if kdir:
++            build_mod.append(f"KDIR={kdir}")
++        subprocess.check_call(build_mod)
++
++        # ensure the module has been unloaded
++        if self.check_module(target.rstrip(".ko")):
++            subprocess.run(["rmmod", target], check=False)
++
++        modpath = f"zdtm/mod/{target}"
++        subprocess.check_call(["insmod", modpath])
++
++    def unload_mod(self, mod):
++        if mod:
++            subprocess.check_call(["rmmod", mod])
++
+     def run_test(self, name, desc, flavor):
+ 
+         if len(self.__subs) >= self.__max:
+@@ -2014,9 +2050,9 @@ class Launcher:
+         with open("/proc/sys/kernel/tainted") as taintfd:
+             taint = taintfd.read()
+         # 0x1000 means the out of tree module has been loaded
+-        if self.__taint != taint and (int(self.__taint) | 0x1000) != int(taint):
++        if self.__taint != taint and (int(self.__taint) | 0x3000) != int(taint):
+             raise Exception("The kernel is tainted: %r (%r)" %
+-                            (taint, self.__taint))
++                            (taint, str(int(self.__taint) | 0x3000)))
+ 
+         if test_flag(desc, 'excl'):
+             self.wait_all()
+@@ -2045,6 +2081,8 @@ class Launcher:
+         # `--use-fork-pid`, so don't care `--pin-memory` option
+         self.modprobe_pin_memory(no_pid_ns)
+ 
++        self.build_and_load_mod(desc.get("mod", ""), opts["kdir"])
++
+         sub = subprocess.Popen(["./zdtm_ct", "zdtm.py"],
+                                env=dict(os.environ, CR_CT_TEST_INFO=arg,
+                                         ZDTM_NO_PID_NS=zdtm_no_pid_ns),
+@@ -2059,9 +2097,11 @@ class Launcher:
+         }
+ 
+         # pin memory function don't support concurrency
+-        if test_flag(desc, 'excl') or test_value(desc, "opts", "--pin-memory"):
++        if test_flag(desc, 'excl') or test_value(desc, "opts", "--pin-memory") or desc.get("mod", ""):
+             self.wait()
+ 
++        self.unload_mod(desc.get("mod", ""))
++
+     def __wait_one(self, flags):
+         pid = -1
+         status = -1
+@@ -2412,6 +2452,11 @@ def run_tests(opts):
+                     t, f"cmdline '{cmdline}' isn't support, or don't set")
+                 continue
+ 
++            sysfs = tdesc.get('sysfs', '')
++            if sysfs and criu.check_sysfs(sysfs):
++                launcher.skip(t, f"sysfs file {sysfs} don't exist")
++                continue
++
+             test_flavs = tdesc.get('flavor', 'h ns uns').split()
+             opts_flavs = (opts['flavor'] or 'h,ns,uns').split(',')
+             if opts_flavs != ['best']:
+@@ -2434,6 +2479,7 @@ def run_tests(opts):
+                 launcher.run_test(t, tdesc, run_flavs)
+             else:
+                 launcher.skip(t, "no flavors")
++
+     finally:
+         fail = launcher.finish()
+         if opts['join_ns']:
+@@ -2723,6 +2769,8 @@ rp.add_argument("--pre-dump-mode",
+ rp.add_argument("--kdat",
+                 help="Path to criu.kdat, default '/run/criu.kdat'",
+                 default="/run/criu.kdat")
++rp.add_argument(
++    "--kdir", help="specific kernel devel path, the default value is `/lib/modules/$(uname -r)/build`")
+ 
+ lp = sp.add_parser("list", help="List tests")
+ lp.set_defaults(action=list_tests)
+diff --git a/test/zdtm/customization/Makefile b/test/zdtm/customization/Makefile
+index 82348f2..93922c7 100644
+--- a/test/zdtm/customization/Makefile
++++ b/test/zdtm/customization/Makefile
+@@ -10,7 +10,8 @@ TST_NOFILE	=	\
+ 		maps04	\
+ 		maps05	\
+ 		maps007	\
+-		maps008
++		maps008	\
++		notifier00
+ 
+ TST_FILE	=	\
+ 		maps00	\
+diff --git a/test/zdtm/customization/notifier00.c b/test/zdtm/customization/notifier00.c
+new file mode 100644
+index 0000000..5fc3d54
+--- /dev/null
++++ b/test/zdtm/customization/notifier00.c
+@@ -0,0 +1,68 @@
++#include <stdio.h>
++/* Historical reasons: in order to compatible with R10 */
++#define CONFIG_EULEROS_MODRESTORE_NOTIFY
++#include <linux/modrestore.h>
++
++#include "zdtmtst.h"
++
++const char *test_doc = "Tests the basic function of the notifiers";
++static char *nvwa_notifiers[] = {
++	"PRE_FREEZE",
++	"FREEZE_TO_KILL",
++	"PRE_UPDATE_KERNEL",
++	"POST_UPDATE_KERNEL",
++	"UNFREEZE_TO_RUN",
++	"POST_RUN"
++};
++
++_Static_assert(sizeof(nvwa_notifiers)/sizeof(nvwa_notifiers[0]) == KUP_HOOK_MAX, "nvwa_notifiers number is wrong!");
++
++int main(int argc, char *argv[])
++{
++    int orig_values[KUP_HOOK_MAX] = {0};
++    bool failure = false;
++    FILE *fp;
++
++    test_init(argc, argv);
++
++    fp = fopen("/sys/kernel/criu_notifier", "r");
++    if (fp == NULL) {
++        pr_perror("fopen");
++        return 1;
++    }
++
++    for (int i = 0; i < KUP_HOOK_MAX; i++)
++        fscanf(fp, "%d ", orig_values+i);
++
++    test_daemon();
++    test_waitsig();
++
++    if (fseek(fp, 0, SEEK_SET) != 0) {
++        pr_perror("fseek");
++        return 2;
++    } 
++
++    for (int i = 0; i < KUP_HOOK_MAX; i++) {
++        int val = 0;
++        int should = orig_values[i]+1;
++        
++        fscanf(fp, "%d ", &val);
++        
++        /* those are not called in criu */
++        if (i == PRE_UPDATE_KERNEL || i == POST_UPDATE_KERNEL)
++            continue;
++            
++        if (val != should) {
++            pr_err("%s notifier is abnormal, it should be %d, but %d.\n",
++                    nvwa_notifiers[i], should, val);
++            failure = true;
++        }
++    }
++    
++    if (failure)
++        fail("notifier is abnormal.");
++    else
++        pass();
++
++    return 0;
++}
+diff --git a/test/zdtm/customization/notifier00.desc b/test/zdtm/customization/notifier00.desc
+new file mode 100644
+index 0000000..1c6b512
+--- /dev/null
++++ b/test/zdtm/customization/notifier00.desc
+@@ -0,0 +1 @@
++{'arch': 'aarch64', 'opts': '--with-notifier', 'flavor': 'h', 'flags': 'suid', 'sysfs': '/sys/kernel/modrestore/nvwa_notifier', 'mod': 'notifier.ko'}
+diff --git a/test/zdtm/mod/.gitignore b/test/zdtm/mod/.gitignore
+new file mode 100644
+index 0000000..7afd412
+--- /dev/null
++++ b/test/zdtm/mod/.gitignore
+@@ -0,0 +1,163 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# NOTE! Don't add files that are generated in specific
++# subdirectories here. Add them in the ".gitignore" file
++# in that subdirectory instead.
++#
++# NOTE! Please use 'git ls-files -i --exclude-standard'
++# command after changing this file, to see if there are
++# any tracked files which get ignored after the change.
++#
++# Normal rules (sorted alphabetically)
++#
++.*
++*.a
++*.asn1.[ch]
++*.bin
++*.bz2
++*.c.[012]*.*
++*.dt.yaml
++*.dtb
++*.dtbo
++*.dtb.S
++*.dwo
++*.elf
++*.gcno
++*.gz
++*.i
++*.ko
++*.lex.c
++*.ll
++*.lst
++*.lz4
++*.lzma
++*.lzo
++*.mod
++*.mod.c
++*.o
++*.o.*
++*.patch
++*.s
++*.so
++*.so.dbg
++*.su
++*.symtypes
++*.symversions
++*.tab.[ch]
++*.tar
++*.xz
++*.zst
++Module.symvers
++modules.order
++
++#
++# Top-level generic files
++#
++/linux
++/modules-only.symvers
++/vmlinux
++/vmlinux.32
++/vmlinux.map
++/vmlinux.symvers
++/vmlinux-gdb.py
++/vmlinuz
++/System.map
++/Module.markers
++/modules.builtin
++/modules.builtin.modinfo
++/modules.nsdeps
++
++#
++# RPM spec file (make rpm-pkg)
++#
++/*.spec
++
++#
++# Debian directory (make deb-pkg)
++#
++/debian/
++
++#
++# Snap directory (make snap-pkg)
++#
++/snap/
++
++#
++# tar directory (make tar*-pkg)
++#
++/tar-install/
++
++#
++# We don't want to ignore the following even if they are dot-files
++#
++!.clang-format
++!.cocciconfig
++!.get_maintainer.ignore
++!.gitattributes
++!.gitignore
++!.mailmap
++
++#
++# Generated include files
++#
++/include/config/
++/include/generated/
++/include/ksym/
++/arch/*/include/generated/
++
++# stgit generated dirs
++patches-*
++
++# quilt's files
++patches
++series
++
++# ctags files
++tags
++TAGS
++
++# cscope files
++cscope.*
++ncscope.*
++
++# gnu global files
++GPATH
++GRTAGS
++GSYMS
++GTAGS
++
++# id-utils files
++ID
++
++*.orig
++*~
++\#*#
++
++#
++# Leavings from module signing
++#
++extra_certificates
++signing_key.pem
++signing_key.priv
++signing_key.x509
++x509.genkey
++
++# Kconfig presets
++/all.config
++/alldef.config
++/allmod.config
++/allno.config
++/allrandom.config
++/allyes.config
++
++# Kconfig savedefconfig output
++/defconfig
++
++# Kdevelop4
++*.kdev4
++
++# Clang's compilation database file
++/compile_commands.json
++
++# Documentation toolchain
++sphinx_*/
+diff --git a/test/zdtm/mod/Makefile b/test/zdtm/mod/Makefile
+new file mode 100644
+index 0000000..10c9c9a
+--- /dev/null
++++ b/test/zdtm/mod/Makefile
+@@ -0,0 +1,28 @@
++# notice:
++#   `ARCH` var is used in both criu and kernel, but they have the different value
++#   for the same architecture(e.g. arm64). Therefore, this Makefile can't be
++#   included in the criu Makefile.
++obj-m += notifier.o
++
++# specific the kernel devel path
++# example (use `/home/me/kernel` as `KDIR`):
++#   $ export KDIR="/home/me/kernel"
++ifeq ($(KDIR),)
++    KDIR := /lib/modules/$(shell uname -r)/build
++endif
++
++# specific the mod src path
++ifeq ($(MOD),)
++    MOD := $(PWD)
++endif
++
++all:
++	$(MAKE) -C $(KDIR) M=$(MOD) modules
++
++clean:
++	$(MAKE) -C $(KDIR) M=$(MOD) clean
++
++.PHONY: all clean
++
++notifier.ko:
++	$(MAKE) -C $(KDIR) M=$(MOD) notifier.ko
+diff --git a/test/zdtm/mod/notifier.c b/test/zdtm/mod/notifier.c
+new file mode 100644
+index 0000000..70a5b33
+--- /dev/null
++++ b/test/zdtm/mod/notifier.c
+@@ -0,0 +1,145 @@
++#define pr_fmt(fmt) KBUILD_MODNAME	": " fmt
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/modrestore.h>
++
++static int values[KUP_HOOK_MAX];
++static char *nvwa_actions[] = {
++	"PREPARE",
++	"ROLLBACK",
++};
++static char *nvwa_notifiers[] = {
++	"PRE_FREEZE",
++	"FREEZE_TO_KILL",
++	"PRE_UPDATE_KERNEL",
++	"POST_UPDATE_KERNEL",
++	"UNFREEZE_TO_RUN",
++	"POST_RUN"
++};
++
++static int nvwa_notifier_func(struct notifier_block *nb, unsigned long val, void *data)
++{
++	struct nvwa_action *action = data;
++
++	switch (action->cmd) {
++	case PREPARE:
++		values[val] += 1;
++		break;
++	case ROLLBACK:
++		values[val] -= 1;
++		break;
++	default:
++		pr_err("invalid cmd: %d", action->cmd);
++		return NOTIFY_BAD;
++	}
++
++	pr_info("nvwa notifier action %s", nvwa_actions[action->cmd]);
++
++	return NOTIFY_DONE;
++}
++
++#define DEFINE_NVWA_NB(name)	\
++	static struct notifier_block nvwa_##name##_nb =	{	\
++		.notifier_call = nvwa_notifier_func,	\
++	}
++
++DEFINE_NVWA_NB(pre_freeze);
++DEFINE_NVWA_NB(freeze_to_kill);
++DEFINE_NVWA_NB(pre_update_kernel);
++DEFINE_NVWA_NB(post_update_kernel);
++DEFINE_NVWA_NB(unfreeze_to_run);
++DEFINE_NVWA_NB(post_run);
++
++static struct notifier_block *nvwa_nbs[] = {
++	&nvwa_pre_freeze_nb,
++	&nvwa_freeze_to_kill_nb,
++	&nvwa_pre_update_kernel_nb,
++	&nvwa_post_update_kernel_nb,
++	&nvwa_unfreeze_to_run_nb,
++	&nvwa_post_run_nb,
++};
++
++static int register_nvwa_notifiers(void)
++{
++	int i;
++
++	BUILD_BUG_ON_MSG(ARRAY_SIZE(nvwa_nbs) != KUP_HOOK_MAX,
++					 "wrong nvwa notifier block size!");
++
++	for (i = 0; i < ARRAY_SIZE(nvwa_nbs); i++) {
++		if (register_nvwa_notifier(i, nvwa_nbs[i]) != 0) {
++			pr_err("register nvwa %s notifier failed!", nvwa_notifiers[i]);
++			goto error;
++		}
++	}
++
++	return 0;
++
++error:
++
++	for (i -= 1; i >= 0; i -= 1)
++		unregister_nvwa_notifier(i, nvwa_nbs[i]);
++
++	return -1;
++}
++
++static void unregister_nvwa_notifiers(void)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(nvwa_nbs); i++)
++		unregister_nvwa_notifier(i, nvwa_nbs[i]);
++}
++
++static ssize_t criu_notifier_store(struct kobject *kobj,
++								   struct kobj_attribute *attr,
++								   const char *buf, size_t count)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(values); i++)
++		values[i] = 0;
++
++	return count;
++}
++
++static ssize_t criu_notifier_show(struct kobject *kobj,
++								  struct kobj_attribute *attr,
++								  char *buf)
++{
++	int i;
++	ssize_t count = 0;
++
++	for (i = 0; i < ARRAY_SIZE(values); i++)
++		count += sprintf(buf+count, "%d ", values[i]);
++
++	buf[count-1] = '\n';
++
++	return count;
++}
++
++static struct kobj_attribute notifier_file = __ATTR_RW(criu_notifier);
++
++static int __init notifier_init(void)
++{
++	if (register_nvwa_notifiers() != 0)
++		return -1;
++
++	if (sysfs_create_file(kernel_kobj, &notifier_file.attr) != 0) {
++		unregister_nvwa_notifiers();
++		return -1;
++	}
++
++	return 0;
++}
++
++static void __exit notifier_exit(void)
++{
++	sysfs_remove_file(kernel_kobj, &notifier_file.attr);
++	unregister_nvwa_notifiers();
++}
++
++module_init(notifier_init);
++module_exit(notifier_exit);
++MODULE_LICENSE("GPL");
+-- 
+2.34.1
+

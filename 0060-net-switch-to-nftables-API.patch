@@ -1,0 +1,55 @@
+From 073ed2ef448fb073aa3c6f0552e120e3e98a8906 Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Wed, 13 Apr 2022 14:30:54 +0800
+Subject: [PATCH 60/72] net: switch to nftables API
+
+This is fake patch
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/config.c             | 2 ++
+ criu/crtools.c            | 1 +
+ criu/include/cr_options.h | 2 ++
+ 3 files changed, 5 insertions(+)
+
+diff --git a/criu/config.c b/criu/config.c
+index c0358e5..7c4e230 100644
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -711,6 +711,8 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		{ "reserve-ports", required_argument, 0, 'P' },
+ 		BOOL_OPT("parallel", &opts.parallel),
+ 		{ "exec-pin-start", required_argument, 0, 2002 },
++		BOOL_OPT("use-nft", &opts.use_nft),
++		BOOL_OPT("async-clear-nft", &opts.async_clear_nft),
+ 		{},
+ 	};
+ 
+diff --git a/criu/crtools.c b/criu/crtools.c
+index 40e2d51..c555213 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -474,6 +474,7 @@ usage:
+ 	       "  --reserve-ports	Reserve src ports in kernel\n"
+ 	       "  --parallel		Collect smaps parallel to accellrate dumping speed\n"
+ 	       "  --exec-pin-start	Exec file map's pin start index\n"
++	       "  --use			Use nft API instead of iptables cmd in network locking\n"
+ 	       "\n"
+ 	       "Check options:\n"
+ 	       "  Without options, \"criu check\" checks availability of absolutely required\n"
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index a64e977..6dadaba 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -203,6 +203,8 @@ struct cr_options {
+ 	int reserve_ports;
+ 	int parallel;
+ 	int exec_pin_start;
++	int use_nft;
++	int async_clear_nft;
+ };
+ 
+ extern struct cr_options opts;
+-- 
+2.34.1
+

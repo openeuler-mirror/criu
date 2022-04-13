@@ -1,0 +1,611 @@
+From 57f1017a9c971d8c3a5ef82d04e6c4bc584e9f00 Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Fri, 8 Apr 2022 16:14:40 +0800
+Subject: [PATCH 72/72] kabichk: add KABI check code
+
+Theory:
+  * The export symbol CRCs source:
+    - /boot/symvers-$(uname -r).gz for Image and in tree modules: the
+      ima mechanism could ensure the file credibility and non-tamper.
+    - ELF section `.symtab` for out of tree modules: the export symbols
+      has `__crc_` prefix, and `st_shndx` is `SHN_ABS`
+  * compare CRC value between the known and the module
+
+Design Details:
+  - collect export symbols from
+    * collect in tree symbols from `/boot/symvers-<release>.gz`
+    * collect out of tree module symbols from the module self
+  - compare external symbols stored in `__versions` section for each module
+
+Usage:
+  python3 -m upgchk.kabichk \
+          [[-r <kernel release>],...]   \
+          [[-m <modname>],...]  \
+          -c <modname>
+Example:
+  python3 -m upgchk.kabichk -c /lib/modules/$(uname -r)/kernel/fs/mbcache.ko
+  python3 -m upgchk.kabichk -m notify.ko -c osp_proc.ko
+
+Note:
+  The pyelftools library can't be import, therefore using elfutils
+  wrapper to replace the library.
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ upgchk/Makefile           |  23 ++++
+ upgchk/lib/modsym.c       | 268 ++++++++++++++++++++++++++++++++++++++
+ upgchk/lib/modsym.h       |  39 ++++++
+ upgchk/setup.py           |  20 +++
+ upgchk/upgchk/__init__.py |  11 ++
+ upgchk/upgchk/kabichk.py  | 163 +++++++++++++++++++++++
+ 6 files changed, 524 insertions(+)
+ create mode 100644 upgchk/Makefile
+ create mode 100644 upgchk/lib/modsym.c
+ create mode 100644 upgchk/lib/modsym.h
+ create mode 100644 upgchk/setup.py
+ create mode 100644 upgchk/upgchk/__init__.py
+ create mode 100644 upgchk/upgchk/kabichk.py
+
+diff --git a/upgchk/Makefile b/upgchk/Makefile
+new file mode 100644
+index 0000000..df6b60e
+--- /dev/null
++++ b/upgchk/Makefile
+@@ -0,0 +1,23 @@
++.PHONY: build install clean
++
++PYTHON=/usr/bin/python3
++TEST=
++PARAMETERS=
++
++build:
++	${PYTHON} setup.py build
++
++dist:
++	${PYTHON} setup.py sdist
++
++install:
++	${PYTHON} setup.py install
++
++clean:
++	${PYTHON} setup.py clean
++	rm -rf	\
++		build	\
++		dist	\
++		upgchk/__pycache__	\
++		upgchk/*.so	\
++		upgchk.egg-info
+diff --git a/upgchk/lib/modsym.c b/upgchk/lib/modsym.c
+new file mode 100644
+index 0000000..eb75f68
+--- /dev/null
++++ b/upgchk/lib/modsym.c
+@@ -0,0 +1,268 @@
++#define PY_SSIZE_T_CLEAN
++#include <Python.h>
++
++#include <fcntl.h>
++#include <stdio.h>
++#include <string.h>
++#include <gelf.h>
++
++#include "modsym.h"
++
++static Elf_Data *get_elf_sec_data(Elf *elf, const char *sec_name)
++{
++	Elf_Scn *scn = NULL;
++	size_t strndx;
++	GElf_Shdr mem;
++	GElf_Shdr *shdr;
++	const char *name;
++
++	/* To get the section names. */
++	if (elf_getshdrstrndx(elf, &strndx) != 0)
++		return NULL;
++
++	while ((scn = elf_nextscn(elf, scn)) != NULL) {
++		shdr = gelf_getshdr(scn, &mem);
++		name = elf_strptr (elf, strndx, shdr->sh_name);
++
++		if (strcmp(name, sec_name) == 0)
++			return elf_getdata(scn, NULL);
++	}
++
++	return NULL;
++}
++
++static void modvers_dealloc(PyObject *obj)
++{
++	ModVersState *mvgstate = (ModVersState *)obj;
++
++	elf_end(mvgstate->elf);
++	return;
++}
++
++static PyObject *modvers_iternext(PyObject *obj)
++{
++	ModVersState *mvgstate = (ModVersState *)obj;
++	struct modversion_info *info = mvgstate->d->d_buf;
++	PyObject *elem = NULL;
++		
++	if (mvgstate->seq_index >= 0) {
++		size_t i = mvgstate->enum_index;
++		/* seq_index < 0 means that the generator is exhausted.
++		 * Returning NULL in this case is enough. The next() builtin
++		 * will raise the StopIteration error for us.
++		 */
++		elem = Py_BuildValue("(sk)", info[i].name, info[i].crc);
++		mvgstate->seq_index -= 1;
++		mvgstate->enum_index += 1;
++	} else {
++		/* The reference to the sequence is cleared in the first
++		 * generator call after its exhaustion (after the call that
++		 * returned the last element).
++		 * Py_CLEAR will be harmless for subsequent calls since it's
++		 * idempotent on NULL.
++		 */
++		mvgstate->seq_index = -1;
++	}
++
++	return elem;
++}
++
++static PyObject *modvers_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
++{
++	ModVersState *mvgstate = NULL;
++	PyObject *file;
++	int fd;
++	Py_ssize_t len;
++
++	if (!PyArg_ParseTuple(args, "O", &file))
++		return NULL;
++
++	fd = PyObject_AsFileDescriptor(file);
++	if (fd < 0)
++		return NULL;
++
++	mvgstate = (ModVersState *)type->tp_alloc(type, 0);
++	if (mvgstate == NULL)
++		return NULL;
++
++	elf_version(EV_CURRENT);
++	mvgstate->elf = elf_begin(fd, ELF_C_READ_MMAP, NULL);
++	if (mvgstate->elf == NULL) {
++		PyErr_Format(PyExc_TypeError, "File not usable: %s\n", elf_errmsg(-1));
++		goto free;
++	}
++
++	mvgstate->d = get_elf_sec_data(mvgstate->elf, VERS_SEC_NAME);
++	if (mvgstate->d == NULL) {
++		PyErr_Format(PyExc_TypeError, "Can't find ELF section `%s`\n", VERS_SEC_NAME);
++		goto elf_end;
++	}
++
++	len = mvgstate->d->d_size / sizeof(struct modversion_info);
++	mvgstate->seq_index = len - 1;
++	mvgstate->enum_index = 0;
++
++	return (PyObject *)mvgstate;
++
++elf_end:
++	elf_end(mvgstate->elf);
++free:
++	type->tp_free(mvgstate);
++	return NULL;
++}
++
++PyTypeObject PyModVersGen_Type = {
++	PyVarObject_HEAD_INIT(NULL, 0)
++	.tp_name = "modvers",
++	.tp_basicsize = sizeof(PyModVersGen_Type),
++	.tp_itemsize = 0,
++	.tp_dealloc = modvers_dealloc,
++	.tp_flags = Py_TPFLAGS_DEFAULT,
++	.tp_iter = PyObject_SelfIter,
++	.tp_iternext = modvers_iternext,
++	.tp_alloc = PyType_GenericAlloc,
++	.tp_new = modvers_new,
++};
++
++static void modcrcs_dealloc(PyObject *obj)
++{
++	ModCRCsState *mcgstate = (ModCRCsState *)obj;
++
++	elf_end(mcgstate->elf);
++	return;
++}
++
++static PyObject *modcrcs_iternext(PyObject *obj)
++{
++	ModCRCsState *mcgstate = (ModCRCsState *)obj;
++	const char *strtab = mcgstate->strtab->d_buf;
++	GElf_Sym *sym = mcgstate->symtab->d_buf;
++	PyObject *elem = NULL;
++
++	while (mcgstate->seq_index >= 0) {
++		size_t i = mcgstate->enum_index;
++		const char *name = strtab + sym[i].st_name;
++
++		mcgstate->seq_index -= 1;
++		mcgstate->enum_index += 1;
++
++		/*
++		 * If the symbol has '__crc_' prefix and absolute value,
++		 * it's export symbol, and has CRC.
++		 */
++		if (strncmp(name, CRC_SYM_PREFIX, strlen(CRC_SYM_PREFIX)) == 0
++				&& sym[i].st_shndx == SHN_ABS) {
++			elem = Py_BuildValue("(sk)",
++					name+strlen(CRC_SYM_PREFIX),
++					sym[i].st_value);
++			break;
++		}
++	}
++
++	return elem;
++}
++
++static PyObject *modcrcs_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
++{
++	ModCRCsState *mcgstate = NULL;
++	PyObject *file;
++	Elf_Data *d;
++	int fd;
++	Py_ssize_t len;
++
++	if (!PyArg_ParseTuple(args, "O", &file))
++		return NULL;
++
++	fd = PyObject_AsFileDescriptor(file);
++	if (fd < 0)
++		return NULL;
++
++	mcgstate = (ModCRCsState *)type->tp_alloc(type, 0);
++	if (mcgstate == NULL)
++		return NULL;
++
++	elf_version(EV_CURRENT);
++	mcgstate->elf = elf_begin(fd, ELF_C_READ_MMAP, NULL);
++	if (mcgstate->elf == NULL) {
++		PyErr_Format(PyExc_TypeError, "File not usable: %s\n", elf_errmsg(-1));
++		goto free;
++	}
++
++	mcgstate->strtab = get_elf_sec_data(mcgstate->elf, STRT_SEC_NAME);
++	if (mcgstate->strtab == NULL) {
++		PyErr_Format(PyExc_TypeError, "Can't find ELF section `%s`\n", STRT_SEC_NAME);
++		goto elf_end;
++	}
++
++	mcgstate->symtab = get_elf_sec_data(mcgstate->elf, SYMT_SEC_NAME);
++	if (mcgstate->symtab == NULL) {
++		PyErr_Format(PyExc_TypeError, "Can't find ELF section `%s`\n", SYMT_SEC_NAME);
++		goto elf_end;
++	}
++
++	len = mcgstate->symtab->d_size / sizeof(GElf_Sym);
++	mcgstate->seq_index = len - 1;
++	mcgstate->enum_index = 0;
++
++	return (PyObject *)mcgstate;
++
++elf_end:
++	elf_end(mcgstate->elf);
++free:
++	type->tp_free(mcgstate);
++	return NULL;
++}
++
++PyTypeObject PyModCRCsGen_Type = {
++	PyVarObject_HEAD_INIT(NULL, 0)
++	.tp_name = "modcrcs",
++	.tp_basicsize = sizeof(PyModCRCsGen_Type),
++	.tp_itemsize = 0,
++	.tp_dealloc = modcrcs_dealloc,
++	.tp_flags = Py_TPFLAGS_DEFAULT,
++	.tp_iter = PyObject_SelfIter,
++	.tp_iternext = modcrcs_iternext,
++	.tp_alloc = PyType_GenericAlloc,
++	.tp_new = modcrcs_new,
++};
++
++/* Module structure */
++/* Module structure */
++static struct PyModuleDef modvers_module = {
++	PyModuleDef_HEAD_INIT,
++	.m_name = "modsym",
++	.m_doc = "iter `" VERS_SEC_NAME "` section items",
++	.m_size = -1,
++};
++
++/* Module initialization function */
++PyMODINIT_FUNC PyInit_modsym(void)
++{
++	PyObject *m = PyModule_Create(&modvers_module);
++	if (m == NULL)
++		return NULL;
++
++	if (PyType_Ready(&PyModVersGen_Type) < 0)
++		return NULL;
++
++	Py_INCREF(&PyModVersGen_Type);
++	if (PyModule_AddObject(m, PyModVersGen_Type.tp_name,
++				(PyObject *)&PyModVersGen_Type) < 0)
++		goto free_vers;
++
++	if (PyType_Ready(&PyModCRCsGen_Type) < 0)
++		goto free_vers;
++
++	Py_INCREF(&PyModCRCsGen_Type);
++	if (PyModule_AddObject(m, PyModCRCsGen_Type.tp_name,
++				(PyObject *)&PyModCRCsGen_Type) < 0)
++		goto free_crcs;
++
++	return m;
++free_crcs:
++	Py_DECREF(&PyModCRCsGen_Type);
++free_vers:
++	Py_DECREF(&PyModVersGen_Type);
++	Py_DECREF(m);
++	return NULL;
++}
+diff --git a/upgchk/lib/modsym.h b/upgchk/lib/modsym.h
+new file mode 100644
+index 0000000..b8069c3
+--- /dev/null
++++ b/upgchk/lib/modsym.h
+@@ -0,0 +1,39 @@
++#ifndef __PYTHON_MODSYM_H__
++#define __PYTHON_MODSYM_H__
++
++#include <libelf.h>
++
++typedef struct {
++	PyObject_HEAD
++	Py_ssize_t seq_index;
++	Py_ssize_t enum_index;
++	Elf *elf;
++	Elf_Data *d;
++} ModVersState;
++
++#define VERS_SEC_NAME		"__versions"
++
++/* --- the following is copied from linux src --- */
++#define MAX_PARAM_PREFIX_LEN	(64 - sizeof(unsigned long))
++#define MODULE_NAME_LEN		MAX_PARAM_PREFIX_LEN
++
++struct modversion_info {
++	unsigned long crc;
++	char name[MODULE_NAME_LEN];
++};
++/* --- end --- */
++
++typedef struct {
++	PyObject_HEAD
++	Py_ssize_t seq_index;
++	Py_ssize_t enum_index;
++	Elf *elf;
++	Elf_Data *strtab;
++	Elf_Data *symtab;
++} ModCRCsState;
++
++#define STRT_SEC_NAME		".strtab"
++#define SYMT_SEC_NAME		".symtab"
++#define CRC_SYM_PREFIX		"__crc_"
++
++#endif /* __PYTHON_MODSYM_H__ */
+diff --git a/upgchk/setup.py b/upgchk/setup.py
+new file mode 100644
+index 0000000..6758c95
+--- /dev/null
++++ b/upgchk/setup.py
+@@ -0,0 +1,20 @@
++#!/usr/bin/python3
++# -*- coding: utf-8 -*-
++
++from setuptools import setup, Extension
++
++if __name__ == "__main__":
++
++    setup(name="upgchk",
++          version="0.1",
++          description="Check the kernel upgrading environment",
++
++          packages=["upgchk"],
++          ext_modules=[
++              Extension("modsym",
++                        sources=["lib/modsym.c"],
++                        libraries=["elf"])
++          ],
++
++          python_requires='>=3.6',
++    )
+diff --git a/upgchk/upgchk/__init__.py b/upgchk/upgchk/__init__.py
+new file mode 100644
+index 0000000..c831e1d
+--- /dev/null
++++ b/upgchk/upgchk/__init__.py
+@@ -0,0 +1,11 @@
++# -*- coding: utf-8 -*-
++
++"""
++.. module:: upgchk
++     :synopsis: Check the kernel upgrading environment
++"""
++
++__title = "upgchk"
++__description = "Check the upgrade environment"
++__license__ = "GPL-2.0-or-later or LGPL-2.1-only"
++__version__ = "0.1"
+diff --git a/upgchk/upgchk/kabichk.py b/upgchk/upgchk/kabichk.py
+new file mode 100644
+index 0000000..cccacf3
+--- /dev/null
++++ b/upgchk/upgchk/kabichk.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/python3
++# -*- coding: utf-8 -*-
++
++'''
++Theory:
++- compare CRC value between the known and the module
++- The export symbols CRC source:
++  * `/boot/symvers-<release>.gz` for in tree modules and Image
++    - the ima mechanism could ensure the file credibility and non-tamper
++  * The `.symtab` section for out of tree modules
++    - name format: `__crc_<symbol name>`
++    - it's absolute value, means: `sym->st_shndx == SHN_ABS`
++
++Design Details:
++- collect export symbols from
++  * collect in tree symbols from `/boot/symvers-<release>.gz`
++  * collect out of tree module symbols from the module self
++- compare external symbols stored in `__versions` section for each module
++
++`__versions` section data format:
++
++    # define MAX_PARAM_PREFIX_LEN (64 - sizeof(unsigned long))
++    # define MODULE_NAME_LEN MAX_PARAM_PREFIX_LEN
++
++    struct modversion_info {
++        unsigned long crc;
++        char name[MODULE_NAME_LEN];
++    };
++
++Usage:
++  python3 -m upgchk.kabichk \
++          [[-r <kernel release>],...]   \
++          [[-m <modname>],...]  \
++          -c <modname>
++Example:
++  python3 -m upgchk.kabichk -c /lib/modules/$(uname -r)/kernel/fs/mbcache.ko
++  python3 -m upgchk.kabichk -m notify.ko -c osp_proc.ko
++'''
++
++import argparse
++import gzip
++import pathlib
++import platform
++from typing import Tuple
++
++import modsym
++
++__all__ = ["KABI"]
++
++ELF_SELFMAG = 4
++ELF_ELFMAG = b"\177ELF"
++
++
++class KABI:
++    def __init__(self, version: str):
++        """
++        read all symbols of the specific kernel
++        """
++        self._symbols = dict()
++        filename = f"symvers-{version}.gz"
++        filepath = pathlib.Path("/boot/").joinpath(filename)
++
++        with gzip.open(filepath, "rt") as f:
++            for line in f.readlines():
++                # (crc, sym, loc, type)
++                (_crc, sym, loc, _) = line.split()
++                crc = int(_crc, 16)  # convert hex crc to integer
++                self._insert(sym, (crc, sym, loc))
++
++    def _insert(self, key: str, val: Tuple[int, str, str]):
++        inst = self._symbols.get(key)
++        if inst is None:
++            self._symbols[key] = val
++        elif inst != val:
++            raise KeyError(
++                f"{key} already exits value {self._symbols[key]}, can't insert new value {val}")
++
++    def _get(self, key: str) -> Tuple[int, str, str]:
++        return self._symbols.get(key)
++
++    def _parse_mod_vers(self, filepath: pathlib.Path) -> Tuple[int, str]:
++        with open(filepath, "rb") as f:
++            magic = f.read(ELF_SELFMAG)
++            if magic != ELF_ELFMAG:
++                raise TypeError(f"{filepath} isn't an ELF file")
++
++            for sym, crc in modsym.modvers(f):
++                yield (sym, crc)
++
++    def check_mod_syms(self, filepath: pathlib.Path) -> Tuple[bool, str]:
++        if not filepath.exists():
++            raise FileNotFoundError(f"{filepath} isn't found")
++
++        for sym, crc in self._parse_mod_vers(filepath):
++            val = self._get(sym)
++            if val is None:
++                msg = f"symbol {sym} isn't known"
++                return (False, msg)
++            elif val[0] != crc:
++                msg = f"symbol {sym} CRC should be {hex(crc)}, but {hex(val[0])}"
++                return (False, msg)
++
++        return (True, "")
++
++    def _parse_mod_crcs(self, filepath: pathlib.Path) -> Tuple[int, str]:
++        with open(filepath, "rb") as f:
++            magic = f.read(ELF_SELFMAG)
++            if magic != ELF_ELFMAG:
++                raise TypeError(f"{filepath} isn't an ELF file")
++
++            for inst in modsym.modcrcs(f):
++                yield inst
++
++    def add_mod_crcs(self, filepath: pathlib.Path):
++        if not filepath.exists():
++            raise FileNotFoundError(f"{filepath} isn't found")
++
++        modname = filepath.name[:-3]
++        for (sym, crc) in self._parse_mod_crcs(filepath):
++            self._insert(sym, (crc, sym, modname))
++
++
++def parse_argument() -> argparse.Namespace:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("-r", "--release", action="store",
++                        required=False, default=platform.release(),
++                        help="specific the kernel release version")
++    parser.add_argument("-m", "--module", action="append",
++                        required=False, default=[],
++                        help="specific the out of tree modules")
++    parser.add_argument("-c", "--check", action="append",
++                        required=True,
++                        help="specific the checked module, e.g. -c a.ko -c b.ko")
++    options = parser.parse_args()
++    return (options.release, options.module, options.check)
++
++
++def main():
++    release, modules, checks = parse_argument()
++    kabi = KABI(release)
++
++    for mod in modules:
++        filepath = pathlib.Path(mod)
++        kabi.add_mod_crcs(filepath)
++
++    print("-------------- start check --------------")
++    passed = 0
++    failed = 0
++    for mod in checks:
++        filepath = pathlib.Path(mod)
++        modname = filepath.name
++        result, msg = kabi.check_mod_syms(filepath)
++        if not result:
++            print(f"module {modname} fail: {msg}")
++            failed += 1
++        else:
++            print(f"module {modname} pass")
++            passed += 1
++    print(f"-------------- {passed} pass, {failed} failed --------------")
++
++
++if __name__ == '__main__':
++    main()
+-- 
+2.34.1
+

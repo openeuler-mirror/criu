@@ -1,0 +1,308 @@
+From 61ca95f5434573e89151d3557185c517cd69447a Mon Sep 17 00:00:00 2001
+From: Sang Yan <sangyan@huawei.com>
+Date: Thu, 8 Jul 2021 14:12:42 +0800
+Subject: [PATCH 38/72] file-lock: add repair mode to dump file locks
+
+Add new options "--file-locks-repair" to enable repair mode
+while dumping file locks.
+Repair mode keeps locks locked while process were killed in
+dumping operation. Then resume the locks from repair mode at
+process resuming.
+
+Signed-off-by: Sang Yan <sangyan@huawei.com>
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/config.c                   |  1 +
+ criu/cr-dump.c                  |  8 ++++++
+ criu/crtools.c                  |  1 +
+ criu/file-lock.c                | 10 +++++++
+ criu/include/cr_options.h       |  1 +
+ criu/include/fcntl.h            | 16 +++++++++++
+ criu/include/parasite-syscall.h |  2 ++
+ criu/include/parasite.h         | 10 +++++++
+ criu/parasite-syscall.c         | 33 +++++++++++++++++++++++
+ criu/pie/parasite.c             | 48 +++++++++++++++++++++++++++++++++
+ 10 files changed, 130 insertions(+)
+
+diff --git a/criu/config.c b/criu/config.c
+index a9eb699..0a0623a 100644
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -705,6 +705,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		BOOL_OPT("with-fd-cred", &opts.with_fd_cred),
+ 		BOOL_OPT("mask-exit-notify", &opts.mask_exit_notify),
+ 		BOOL_OPT("weak-file-check", &opts.weak_file_check),
++		BOOL_OPT("file-locks-repair", &opts.file_locks_repair),
+ 		{},
+ 	};
+ 
+diff --git a/criu/cr-dump.c b/criu/cr-dump.c
+index e7b5787..607eac2 100644
+--- a/criu/cr-dump.c
++++ b/criu/cr-dump.c
+@@ -1679,6 +1679,14 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
+ 		goto err_cure;
+ 	}
+ 
++	if (opts.file_locks_repair) {
++		ret = parasite_dump_file_locks(parasite_ctl, pid);
++		if (ret) {
++			pr_err("Can't parasite dump file locks (pid: %d)\n", pid);
++			goto err_cure;
++		}
++	}
++
+ 	ret = dump_task_core_all(parasite_ctl, item, &pps_buf, cr_imgset, &misc);
+ 	if (ret) {
+ 		pr_err("Dump core (pid: %d) failed with %d\n", pid, ret);
+diff --git a/criu/crtools.c b/criu/crtools.c
+index e1afeca..7358918 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -456,6 +456,7 @@ usage:
+ 	       "  --with-fd-cred	Allow to make the restored process has the same cred\n"
+ 	       "  --mask-exit-notify	Mask task exit notify during dump and restore\n"
+ 	       "  --weak-file-check	Allow file size and mod larger than dumping value\n"
++	       "  --file-locks-repair	Use repair mode to dump and restore file locks\n"
+ 	       "\n"
+ 	       "Check options:\n"
+ 	       "  Without options, \"criu check\" checks availability of absolutely required\n"
+diff --git a/criu/file-lock.c b/criu/file-lock.c
+index 6334462..c893083 100644
+--- a/criu/file-lock.c
++++ b/criu/file-lock.c
+@@ -424,6 +424,8 @@ void discard_dup_locks_tail(pid_t pid, int fd)
+ 	list_for_each_entry_safe_reverse(fl, p, &file_lock_list, list) {
+ 		if (fl->owners_fd != fd || pid != fl->fl_holder)
+ 			break;
++		if (fl->fl_kind == FL_POSIX)
++			continue;
+ 
+ 		list_del(&fl->list);
+ 		xfree(fl);
+@@ -611,8 +613,12 @@ static int restore_file_lock(FileLockEntry *fle)
+ 			cmd = fle->type;
+ 		} else if (fle->type == F_RDLCK) {
+ 			cmd = LOCK_SH;
++			if (opts.file_locks_repair)
++				cmd = LOCK_REPAIR;
+ 		} else if (fle->type == F_WRLCK) {
+ 			cmd = LOCK_EX;
++			if (opts.file_locks_repair)
++				cmd = LOCK_REPAIR;
+ 		} else if (fle->type == F_UNLCK) {
+ 			cmd = LOCK_UN;
+ 		} else {
+@@ -638,6 +644,10 @@ static int restore_file_lock(FileLockEntry *fle)
+ 		flk.l_pid = fle->pid;
+ 		flk.l_type = fle->type;
+ 
++		if (opts.file_locks_repair
++				&& (fle->type == F_RDLCK || fle->type == F_WRLCK))
++			flk.l_type = F_REPAIR;
++
+ 		pr_info("(posix)flag: %d, type: %d, pid: %d, fd: %d, "
+ 			"start: %8" PRIx64 ", len: %8" PRIx64 "\n",
+ 			fle->flag, fle->type, fle->pid, fle->fd, fle->start, fle->len);
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index dec0082..9ec8034 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -197,6 +197,7 @@ struct cr_options {
+ 	int with_fd_cred;
+ 	int mask_exit_notify;
+ 	int weak_file_check;
++	int file_locks_repair;
+ };
+ 
+ extern struct cr_options opts;
+diff --git a/criu/include/fcntl.h b/criu/include/fcntl.h
+index 568977c..0627818 100644
+--- a/criu/include/fcntl.h
++++ b/criu/include/fcntl.h
+@@ -23,6 +23,22 @@ struct f_owner_ex {
+ #define F_SETCRED	18
+ #endif
+ 
++#ifndef F_NEED_REPAIR
++#define F_NEED_REPAIR	16
++#endif
++
++#ifndef F_REPAIR
++#define F_REPAIR	32
++#endif
++
++#ifndef LOCK_NEED_REPAIR
++#define LOCK_NEED_REPAIR	256	/* REPAIRING lock */
++#endif
++
++#ifndef LOCK_REPAIR
++#define LOCK_REPAIR		512	/* REPAIR lock */
++#endif
++
+ /*
+  * These things are required to compile on CentOS-6
+  */
+diff --git a/criu/include/parasite-syscall.h b/criu/include/parasite-syscall.h
+index 4540e11..9f2d3e0 100644
+--- a/criu/include/parasite-syscall.h
++++ b/criu/include/parasite-syscall.h
+@@ -48,4 +48,6 @@ extern int parasite_dump_cgroup(struct parasite_ctl *ctl, struct parasite_dump_c
+ 
+ extern struct parasite_tty_args *parasite_dump_tty(struct parasite_ctl *ctl, int fd, int type);
+ 
++extern int parasite_dump_file_locks(struct parasite_ctl *ctl, int pid);
++
+ #endif /* __CR_PARASITE_SYSCALL_H__ */
+diff --git a/criu/include/parasite.h b/criu/include/parasite.h
+index d2a0688..230c453 100644
+--- a/criu/include/parasite.h
++++ b/criu/include/parasite.h
+@@ -37,6 +37,7 @@ enum {
+ 	PARASITE_CMD_CHECK_VDSO_MARK,
+ 	PARASITE_CMD_CHECK_AIOS,
+ 	PARASITE_CMD_DUMP_CGROUP,
++	PARASITE_CMD_DUMP_FILELOCKS,
+ 
+ 	PARASITE_CMD_MAX,
+ };
+@@ -244,6 +245,15 @@ struct parasite_dump_cgroup_args {
+ 	char contents[1 << 12];
+ };
+ 
++struct parasite_dump_filelocks_args {
++	short	kind;
++	short	type;
++	long	start;
++	long	len;
++	int	pid;
++	int	fd;
++};
++
+ #endif /* !__ASSEMBLY__ */
+ 
+ #endif /* __CR_PARASITE_H__ */
+diff --git a/criu/parasite-syscall.c b/criu/parasite-syscall.c
+index ee4fa86..c57f854 100644
+--- a/criu/parasite-syscall.c
++++ b/criu/parasite-syscall.c
+@@ -32,6 +32,7 @@
+ #include <compel/plugins/std/syscall-codes.h>
+ #include "signal.h"
+ #include "sigframe.h"
++#include "file-lock.h"
+ 
+ #include <string.h>
+ #include <stdlib.h>
+@@ -654,3 +655,35 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
+ 
+ 	return ctl;
+ }
++
++int parasite_dump_file_locks(struct parasite_ctl *ctl, int pid)
++{
++	struct parasite_dump_filelocks_args *args;
++	struct file_lock *fl;
++	int ret;
++
++	args = compel_parasite_args(ctl, struct parasite_dump_filelocks_args);
++
++	list_for_each_entry(fl, &file_lock_list, list) {
++		if (fl->real_owner != pid)
++			continue;
++
++		args->pid = fl->real_owner;
++		args->fd = fl->owners_fd;
++		args->kind = fl->fl_kind;
++		args->type = fl->fl_ltype;
++		args->start = fl->start;
++		if (!strncmp(fl->end, "EOF", 3))
++			args->len = 0;
++		else
++			args->len = (atoll(fl->end) + 1) - fl->start;
++
++		ret = compel_rpc_call_sync(PARASITE_CMD_DUMP_FILELOCKS, ctl);
++		if (ret < 0) {
++			pr_err("Parasite dump file lock failed! (pid: %d)\n", pid);
++			return ret;
++		}
++	}
++
++	return 0;
++}
+diff --git a/criu/pie/parasite.c b/criu/pie/parasite.c
+index e49958b..c781303 100644
+--- a/criu/pie/parasite.c
++++ b/criu/pie/parasite.c
+@@ -22,6 +22,7 @@
+ #include "criu-log.h"
+ #include "tty.h"
+ #include "aio.h"
++#include "file-lock.h"
+ 
+ #include "asm/parasite.h"
+ #include "restorer.h"
+@@ -769,6 +770,50 @@ static int parasite_dump_cgroup(struct parasite_dump_cgroup_args *args)
+ 	return 0;
+ }
+ 
++static int set_filelocks_needrepair(struct parasite_dump_filelocks_args *args)
++{
++	int ret;
++
++	if (args->kind == FL_FLOCK) {
++		if (args->type == F_RDLCK || args->type == F_WRLCK) {
++			int cmd = LOCK_NEED_REPAIR;
++
++			pr_info("Need Repair flock kind: %d, type: %d, cmd: %d, pid: %d, fd: %d\n",
++				args->kind, args->type, cmd, args->pid, args->fd);
++
++			ret = sys_flock(args->fd, cmd);
++			if (ret < 0) {
++				pr_err("Can not set NEED_REPAIR flock!\n");
++				return ret;
++			}
++		}
++	} else if (args->kind == FL_POSIX) {
++		if (args->type == F_RDLCK || args->type == F_WRLCK) {
++			struct flock flk;
++			memset(&flk, 0, sizeof(flk));
++
++			flk.l_whence = SEEK_SET;
++			flk.l_start  = args->start;
++			flk.l_len    = args->len;
++			flk.l_pid    = args->pid;
++			flk.l_type   = F_NEED_REPAIR;
++
++			pr_info("Need Repair posix lock kind: %d, type: %d, cmd: %d, pid: %d, fd: %d, "
++				"start: %8"PRIx64", len: %8"PRIx64"\n",
++				args->kind, args->type, flk.l_type, args->pid, args->fd,
++				args->start, args->len);
++
++			ret = sys_fcntl(args->fd, F_SETLKW, (long)&flk);
++			if (ret < 0) {
++				pr_err("Can not set NEED_REPAIR posix lock!\n");
++				return ret;
++			}
++		}
++	}
++
++	return 0;
++}
++
+ void parasite_cleanup(void)
+ {
+ 	if (mprotect_args) {
+@@ -821,6 +866,9 @@ int parasite_daemon_cmd(int cmd, void *args)
+ 	case PARASITE_CMD_DUMP_CGROUP:
+ 		ret = parasite_dump_cgroup(args);
+ 		break;
++	case PARASITE_CMD_DUMP_FILELOCKS:
++		ret = set_filelocks_needrepair(args);
++		break;
+ 	default:
+ 		pr_err("Unknown command in parasite daemon thread leader: %d\n", cmd);
+ 		ret = -1;
+-- 
+2.34.1
+

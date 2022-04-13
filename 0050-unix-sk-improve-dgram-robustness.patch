@@ -1,0 +1,83 @@
+From 6dde331da8e28e129010aee391e7ef3d757490cd Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Tue, 26 Oct 2021 11:13:27 +0800
+Subject: [PATCH 50/72] unix sk: improve dgram robustness
+
+We should try out best to ensure the success of criu. As for unix dgram
+socket, criu use re-connect instead of repair instead of unix stream
+socket. Therefore, this patch does the following things:
+
+- detect unix dgram unix sock file when criu dumps unix dgram socket
+- add the fault tolerance of unix dgram socket connecting (focus on the
+  condition of `/dev/log` disappearance when rsyslog restart)
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/21
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/sk-unix.c | 35 +++++++++++++++++++++++++++++++++--
+ 1 file changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/criu/sk-unix.c b/criu/sk-unix.c
+index 86bfa18..de75425 100644
+--- a/criu/sk-unix.c
++++ b/criu/sk-unix.c
+@@ -11,6 +11,7 @@
+ #include <stdlib.h>
+ #include <dlfcn.h>
+ #include <libgen.h>
++#include <time.h>
+ 
+ #include "libnetlink.h"
+ #include "cr_options.h"
+@@ -1435,6 +1436,33 @@ err:
+ 	return -1;
+ }
+ 
++/*
++ * Sometimes, `/dev/log` will disappear because of the restart of rsyslog when
++ * rotating, criu try to connect `/dev/log` will report error at this time. We
++ * should try our best to ensure the success of criu restoration. Therefore,
++ * retry three times here.
++ */
++static int unix_dgram_reconnect(int fd, struct sockaddr_un *addr, int len)
++{
++	int retval = 0;
++	struct timespec tim = {
++		.tv_sec = 0,
++		.tv_nsec = 5e+8,
++	};
++
++	for (int i = 0; i < 3; i++) {
++		nanosleep(&tim, NULL);
++		pr_warn("Can't connect unix socket(%s), %d retry\n",
++					addr->sun_path, i);
++		retval = connect(fd, (struct sockaddr *)addr,
++					sizeof(addr->sun_family) + len);
++		if (retval == 0)
++			break;
++	}
++
++	return retval;
++}
++
+ static int post_open_standalone(struct file_desc *d, int fd)
+ {
+ 	int fdstore_fd = -1, procfs_self_dir = -1, len;
+@@ -1521,8 +1549,11 @@ static int post_open_standalone(struct file_desc *d, int fd)
+ 			goto err_revert_and_exit;
+ 		}
+ 	} else if (connect(fd, (struct sockaddr *)&addr, sizeof(addr.sun_family) + len) < 0) {
+-		pr_perror("Can't connect %d socket", ui->ue->ino);
+-		goto err_revert_and_exit;
++		if (ui->ue->type != SOCK_DGRAM || errno != ENOENT
++				|| unix_dgram_reconnect(fd, &addr, len) != 0) {
++			pr_perror("Can't connect %d socket", ui->ue->ino);
++			goto err_revert_and_exit;
++		}
+ 	}
+ 	mutex_unlock(mutex_ghost);
+ 
+-- 
+2.34.1
+

@@ -1,0 +1,139 @@
+From c7f9888e234a626a4d7bf31b89d66b91607f9785 Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fu.lin10@huawei.com>
+Date: Tue, 27 Jul 2021 11:40:34 +0800
+Subject: [PATCH 44/72] proc parse: fix vma offset value for the sysfs file of
+ pci devices
+
+Some pci devices create bin sysfs file which permit to use `mmap()`
+syscall, the 6th parameter `offset` is always 0 when those kinds of
+files create file mapping. The value of `offset` will be assign to
+`vma->vm_pgoff` in kernel. However, it will be changed to pci address
+automically during mmap callback function `pci_mmap_resource_range()`,
+and the offset in `/proc/<pid>/maps` will show non-zero. It will result
+criu restore fails.
+
+There are many of those files. Just retry the mmap action.
+
+NOTICE: the stragy is try best, not whitelist.
+
+Signed-off-by: He Jingxian <hejingxian@huawei.com>
+Signed-off-by: fu.lin <fu.lin10@huawei.com>
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/include/image.h |  1 +
+ criu/pie/restorer.c  | 22 +++++++++++++++++++---
+ criu/proc_parse.c    | 32 ++++++++++++++++++++++++++++++++
+ 3 files changed, 52 insertions(+), 3 deletions(-)
+
+diff --git a/criu/include/image.h b/criu/include/image.h
+index 66492c0..0156314 100644
+--- a/criu/include/image.h
++++ b/criu/include/image.h
+@@ -86,6 +86,7 @@
+ #define VMA_AREA_MEMFD	 (1 << 14)
+ #define VMA_AREA_ANON_INODE (1 << 15)
+ #define VMA_AREA_CHR     (1 << 16)
++#define VMA_AREA_DEV_SHARE	(1 << 17)
+ 
+ #define VMA_CLOSE	  (1 << 28)
+ #define VMA_NO_PROT_WRITE (1 << 29)
+diff --git a/criu/pie/restorer.c b/criu/pie/restorer.c
+index fde6e30..67b0d4c 100644
+--- a/criu/pie/restorer.c
++++ b/criu/pie/restorer.c
+@@ -883,8 +883,9 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
+ 	 * that mechanism as it causes the process to be charged for memory
+ 	 * immediately upon mmap, not later upon preadv().
+ 	 */
+-	pr_debug("\tmmap(%" PRIx64 " -> %" PRIx64 ", %x %x %d)\n", vma_entry->start, vma_entry->end, prot, flags,
+-		 (int)vma_entry->fd);
++	pr_debug("\tmmap(%" PRIx64 " -> %" PRIx64 ", %x %x %d %lx)\n",
++		 vma_entry->start, vma_entry->end, prot, flags,
++		 (int)vma_entry->fd, vma_entry->pgoff);
+ 	/*
+ 	 * Should map memory here. Note we map them as
+ 	 * writable since we're going to restore page
+@@ -892,6 +893,20 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
+ 	 */
+ 	addr = sys_mmap(decode_pointer(vma_entry->start), vma_entry_len(vma_entry), prot, flags, vma_entry->fd,
+ 			vma_entry->pgoff);
++	/* Some drivers implements its own mmap callback, the `mmap()` argument
++	 * `offset` has the differet semantic with POSIX standard. Therefore,
++	 * try to re-mmap with offset 0.
++	 *
++	 * NOTICE: the stragy is try best, not whitelist.
++	 */
++	if (addr == -EINVAL && vma_entry->pgoff != 0) {
++		pr_info("try mmap with offset 0\n");
++		addr = sys_mmap(decode_pointer(vma_entry->start),
++				vma_entry_len(vma_entry),
++				prot, flags,
++				vma_entry->fd,
++				0);
++	}
+ 
+ 	if ((vma_entry->fd != -1) && (vma_entry->status & VMA_CLOSE))
+ 		sys_close(vma_entry->fd);
+@@ -1979,7 +1994,8 @@ long __export_restore_task(struct task_restore_args *args)
+ 		if (!vma_entry->has_madv || !vma_entry->madv)
+ 			continue;
+ 
+-		if (vma_entry_is(vma_entry, VMA_AREA_ANON_INODE))
++		if (vma_entry_is(vma_entry, VMA_AREA_ANON_INODE) ||
++			vma_entry_is(vma_entry, VMA_AREA_DEV_SHARE))
+ 			continue;
+ 
+ 		for (m = 0; m < sizeof(vma_entry->madv) * 8; m++) {
+diff --git a/criu/proc_parse.c b/criu/proc_parse.c
+index d13589c..282a2e9 100644
+--- a/criu/proc_parse.c
++++ b/criu/proc_parse.c
+@@ -552,6 +552,35 @@ static inline int handle_vvar_vma(struct vma_area *vma)
+ 	return 0;
+ }
+ 
++static bool is_sysfs_resource(const char *path)
++{
++	char *sub = NULL;
++	const char *prefix = "resource";
++	const char *suffix = "_wc";
++
++	if (strstr(path, "devices/") == NULL)
++		return false;
++
++	sub = rindex(path, '/');
++	if (sub == NULL)
++		return false;
++
++	sub += 1;
++	if (strncmp(sub, prefix, strlen(prefix)) != 0)
++		return false;
++
++	sub += strlen(prefix);
++	while (*sub != '\0' && (*sub >= '0' && *sub <= '9'))
++		sub += 1;
++
++	if (*sub == '\0')
++		return true;
++	if (!strcmp(sub, suffix))
++		return true;
++	else
++		return false;
++}
++
+ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_path, DIR *map_files_dir,
+ 		      struct vma_file_info *vfi, struct vma_file_info *prev_vfi, int *vm_file_fd)
+ {
+@@ -571,6 +600,9 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
+ 			goto err;
+ 	} else if (!strcmp(file_path, "[heap]")) {
+ 		vma_area->e->status |= VMA_AREA_REGULAR | VMA_AREA_HEAP;
++	} else if (is_sysfs_resource(file_path)) {
++		pr_info("find sys device module share memory\n");
++		vma_area->e->status |= VMA_AREA_REGULAR | VMA_AREA_DEV_SHARE;
+ 	} else {
+ 		vma_area->e->status = VMA_AREA_REGULAR;
+ 	}
+-- 
+2.34.1
+

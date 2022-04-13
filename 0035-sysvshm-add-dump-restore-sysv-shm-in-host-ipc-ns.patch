@@ -1,0 +1,114 @@
+From 852b4db35a06ed382e287d88cd055fdf20fc031f Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fu.lin10@huawei.com>
+Date: Sat, 26 Jun 2021 15:18:15 +0800
+Subject: [PATCH 35/72] sysvshm: add dump/restore sysv-shm in host ipc ns
+
+In original criu design, SysVIPC memory segment, which belongs
+to host ipcns, shouldn't be dumped because criu requires the
+whole ipcns to be dumped. During the restoring ipcns, the new
+shared memory will be created, and fill the original page data
+in it.
+
+This patch makes the shared-memory in host ipcns restore possible.
+Idea:
+  The SysVIPC memory won't disappear after the task exit. The basic
+information can be got from `/proc/sysvipc/shm` as long as the
+system doesn't reboot. Compared with restoring the whole ipcns,
+the processes of the shared memory creating and page data filling
+are ignored.
+
+Reference:
+- https://www.criu.org/What_cannot_be_checkpointed
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/21
+Signed-off-by: fu.lin <fu.lin10@huawei.com>
+---
+ criu/cr-dump.c    |  8 ++++----
+ criu/cr-restore.c | 43 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 47 insertions(+), 4 deletions(-)
+
+diff --git a/criu/cr-dump.c b/criu/cr-dump.c
+index b7e0214..e7b5787 100644
+--- a/criu/cr-dump.c
++++ b/criu/cr-dump.c
+@@ -463,11 +463,11 @@ static int dump_filemap(struct vma_area *vma_area, int fd)
+ 
+ static int check_sysvipc_map_dump(pid_t pid, VmaEntry *vma)
+ {
+-	if (root_ns_mask & CLONE_NEWIPC)
+-		return 0;
++	if (!(root_ns_mask & CLONE_NEWIPC))
++		pr_info("Task %d with SysVIPC shmem map @%" PRIx64 " doesn't live in IPC ns\n",
++			pid, vma->start);
+ 
+-	pr_err("Task %d with SysVIPC shmem map @%" PRIx64 " doesn't live in IPC ns\n", pid, vma->start);
+-	return -1;
++	return 0;
+ }
+ 
+ static int get_task_auxv(pid_t pid, MmEntry *mm)
+diff --git a/criu/cr-restore.c b/criu/cr-restore.c
+index 09f135b..152bace 100644
+--- a/criu/cr-restore.c
++++ b/criu/cr-restore.c
+@@ -1818,6 +1818,46 @@ static int create_children_and_session(void)
+ 	return 0;
+ }
+ 
++static int prepare_rootns_sysv_shm(unsigned long clone_flags)
++{
++	int retval = 0;
++	char *line = NULL;
++	size_t len = 0;
++	FILE *fp;
++	key_t key;
++	int shmid;
++	mode_t	mode;
++	size_t size;
++
++	/* This is completed by `prepare_namespace()` */
++	if (!!(clone_flags & CLONE_NEWIPC))
++		return 0;
++
++	pr_info("Restoring SYSV shm in host namespace\n");
++
++	fp = fopen("/proc/sysvipc/shm", "r");
++	if (fp == NULL) {
++		pr_err("Can't open '/proc/sysvipc/shm', errno(%d): %s\n", errno, strerror(errno));
++		return -1;
++	}
++
++	while (getline(&line, &len, fp) != -1) {
++		if (sscanf(line, "%d %d %o %lu", &key, &shmid, &mode, &size) != 4)
++			continue;
++
++		pr_debug("sscanf key: %d shmid: %d mode %o size %lu\n",
++				key, shmid, mode, size);
++
++		retval = collect_sysv_shmem(shmid, size);
++		if (retval != 0)
++			goto out;
++	}
++
++out:
++	fclose(fp);
++	return retval;
++}
++
+ static int restore_task_with_children(void *_arg)
+ {
+ 	struct cr_clone_arg *ca = _arg;
+@@ -1924,6 +1964,9 @@ static int restore_task_with_children(void *_arg)
+ 		if (prepare_namespace(current, ca->clone_flags))
+ 			goto err;
+ 
++		if (prepare_rootns_sysv_shm(ca->clone_flags))
++			goto err;
++
+ 		if (restore_finish_ns_stage(CR_STATE_PREPARE_NAMESPACES, CR_STATE_FORKING) < 0)
+ 			goto err;
+ 
+-- 
+2.34.1
+

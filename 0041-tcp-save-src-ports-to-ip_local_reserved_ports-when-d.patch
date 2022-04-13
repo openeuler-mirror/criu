@@ -1,0 +1,273 @@
+From aac63cee766bb6840326d008ed1b1993bb7c629a Mon Sep 17 00:00:00 2001
+From: Liu Chao <liuchao173@huawei.com>
+Date: Mon, 19 Jul 2021 03:19:30 +0000
+Subject: [PATCH 41/72] tcp: save src ports to ip_local_reserved_ports when
+ dump tasks and retore it when restore tasks
+
+Signed-off-by: Liu Chao <liuchao173@huawei.com>
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/Makefile.crtools         |  1 +
+ criu/config.c                 |  8 ++-
+ criu/cr-dump.c                |  4 ++
+ criu/crtools.c                |  1 +
+ criu/include/cr_options.h     |  1 +
+ criu/include/reserved-ports.h | 10 ++++
+ criu/net.c                    |  6 +++
+ criu/reserved-ports.c         | 98 +++++++++++++++++++++++++++++++++++
+ criu/sk-tcp.c                 |  2 +-
+ 9 files changed, 129 insertions(+), 2 deletions(-)
+ create mode 100644 criu/include/reserved-ports.h
+ create mode 100644 criu/reserved-ports.c
+
+diff --git a/criu/Makefile.crtools b/criu/Makefile.crtools
+index 65cc215..3e522b4 100644
+--- a/criu/Makefile.crtools
++++ b/criu/Makefile.crtools
+@@ -94,6 +94,7 @@ obj-y			+= pin-mem.o
+ obj-y			+= devname.o
+ obj-y			+= files-chr.o
+ obj-y			+= exit-notify.o
++obj-y			+= reserved-ports.o
+ obj-$(CONFIG_HAS_LIBBPF)	+= bpfmap.o
+ obj-$(CONFIG_COMPAT)	+= pie-util-vdso-elf32.o
+ CFLAGS_pie-util-vdso-elf32.o	+= -DCONFIG_VDSO_32
+diff --git a/criu/config.c b/criu/config.c
+index 7e92731..ae5f81e 100644
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -615,7 +615,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		"no-" OPT_NAME, no_argument, SAVE_TO, false \
+ 	}
+ 
+-	static const char short_opts[] = "dSsRt:hD:o:v::x::Vr:jJ:lW:L:M:";
++	static const char short_opts[] = "dSsRt:hD:o:v::x::Vr:jJ:lW:L:M:P:";
+ 	static struct option long_opts[] = {
+ 		{ "tree", required_argument, 0, 't' },
+ 		{ "leave-stopped", no_argument, 0, 's' },
+@@ -708,6 +708,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		BOOL_OPT("file-locks-repair", &opts.file_locks_repair),
+ 		{ "share-dst-ports", required_argument, 0, 2000 },
+ 		{ "share-src-ports", required_argument, 0, 2001 },
++		{ "reserve-ports", required_argument, 0, 'P' },
+ 		{},
+ 	};
+ 
+@@ -1057,6 +1058,11 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		case 'h':
+ 			*usage_error = false;
+ 			return 2;
++		case 'P':
++			opts.reserve_ports = atoi(optarg);
++			if (opts.reserve_ports < 0)
++				goto bad_arg;
++			break;
+ 		default:
+ 			return 2;
+ 		}
+diff --git a/criu/cr-dump.c b/criu/cr-dump.c
+index 607eac2..a8ab61e 100644
+--- a/criu/cr-dump.c
++++ b/criu/cr-dump.c
+@@ -89,6 +89,7 @@
+ #include "pin-mem.h"
+ #include "notifier.h"
+ #include "files-chr.h"
++#include "reserved-ports.h"
+ 
+ /*
+  * Architectures can overwrite this function to restore register sets that
+@@ -2223,6 +2224,9 @@ int cr_dump_tasks(pid_t pid)
+ 			goto err;
+ 	}
+ 
++	if (opts.reserve_ports > 0)
++		set_reserved_ports();
++
+ 	if (parent_ie) {
+ 		inventory_entry__free_unpacked(parent_ie, NULL);
+ 		parent_ie = NULL;
+diff --git a/criu/crtools.c b/criu/crtools.c
+index cfa149a..ae858e8 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -460,6 +460,7 @@ usage:
+ 	       "  --mask-exit-notify	Mask task exit notify during dump and restore\n"
+ 	       "  --weak-file-check	Allow file size and mod larger than dumping value\n"
+ 	       "  --file-locks-repair	Use repair mode to dump and restore file locks\n"
++	       "  --reserve-ports	Reserve src ports in kernel\n"
+ 	       "\n"
+ 	       "Check options:\n"
+ 	       "  Without options, \"criu check\" checks availability of absolutely required\n"
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index b7c1e34..3b61c6b 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -200,6 +200,7 @@ struct cr_options {
+ 	int file_locks_repair;
+ 	char *share_dst_ports;
+ 	char *share_src_ports;
++	int reserve_ports;
+ };
+ 
+ extern struct cr_options opts;
+diff --git a/criu/include/reserved-ports.h b/criu/include/reserved-ports.h
+new file mode 100644
+index 0000000..b614482
+--- /dev/null
++++ b/criu/include/reserved-ports.h
+@@ -0,0 +1,10 @@
++#ifndef __CRIU_RESERVED_PORTS_H__
++#define __CRIU_RESERVED_PORTS_H__
++
++#define RESERVED_PORTS_PATH	"/proc/sys/net/ipv4/ip_local_reserved_ports"
++
++extern void read_reserved_ports(char *path);
++extern void write_reserved_ports(char *path);
++extern void set_reserved_ports(void);
++
++#endif /* __CRIU_RESERVED_PORTS_H__ */
+diff --git a/criu/net.c b/criu/net.c
+index 7b45f06..fff4c85 100644
+--- a/criu/net.c
++++ b/criu/net.c
+@@ -46,6 +46,7 @@
+ #include "external.h"
+ #include "fdstore.h"
+ #include "netfilter.h"
++#include "reserved-ports.h"
+ 
+ #include "protobuf.h"
+ #include "images/netdev.pb-c.h"
+@@ -3193,6 +3194,11 @@ void network_unlock(void)
+ {
+ 	pr_info("Unlock network\n");
+ 
++	if (opts.reserve_ports) {
++		read_reserved_ports("ip_local_reserved_ports");
++		write_reserved_ports(RESERVED_PORTS_PATH);
++	}
++
+ 	cpt_unlock_tcp_connections();
+ 	rst_unlock_tcp_connections();
+ 
+diff --git a/criu/reserved-ports.c b/criu/reserved-ports.c
+new file mode 100644
+index 0000000..b4996ab
+--- /dev/null
++++ b/criu/reserved-ports.c
+@@ -0,0 +1,98 @@
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <linux/limits.h>
++
++#include "log.h"
++#include "cr_options.h"
++#include "util.h"
++#include "sk-inet.h"
++#include "reserved-ports.h"
++
++#include "common/list.h"
++
++static char* reserved_ports;
++static int reserved_ports_num;
++extern struct list_head cpt_tcp_repair_sockets;
++
++void read_reserved_ports(char *path)
++{
++	FILE *file = NULL;
++	char *ch = NULL;
++	size_t size = 0;
++
++	if (reserved_ports) {
++		free(reserved_ports);
++		reserved_ports = NULL;
++	}
++
++	file = fopen(path, "r");
++	if (!file) {
++		pr_err("Cannot fopen %s\n", path);
++		return;
++	}
++
++	if (getline(&reserved_ports, &size, file) <= 0)
++		pr_err("Cannot getline from %s\n", path);
++	fclose(file);
++
++	if (!reserved_ports)
++		return;
++
++	ch = strstr(reserved_ports, "\n");
++	if (ch)
++		*ch = '\0';
++}
++
++void write_reserved_ports(char *path)
++{
++	int fd = -1;
++	char buf[PATH_MAX];
++
++	fd = open(path, O_RDWR | O_CREAT, 0640);
++	if (fd < 0) {
++		pr_err("Cannot open %s ret %d cwd: %s\n", path, fd, buf);
++		return;
++	}
++
++	cr_system(-1, fd, -1, "/usr/bin/echo",
++		  (char *[]) { "echo", reserved_ports, NULL}, 0);
++	close(fd);
++}
++
++static int add_reserved_ports(struct inet_sk_desc *sk)
++{
++	if (reserved_ports_num >= opts.reserve_ports)
++		return -1;
++
++	if (strlen(reserved_ports) == 0)
++		snprintf(reserved_ports, 6, "%u", sk->src_port);
++	else
++		snprintf(reserved_ports + strlen(reserved_ports), 7, ",%u", sk->src_port);
++	reserved_ports_num++;
++
++	return 0;
++}
++
++void set_reserved_ports(void)
++{
++	struct inet_sk_desc *sk = NULL;
++	size_t size = 0;
++
++	read_reserved_ports(RESERVED_PORTS_PATH);
++
++	write_reserved_ports("ip_local_reserved_ports");
++
++	size = strlen(reserved_ports) + 6 * opts.reserve_ports + 1;
++	if (xrealloc_safe(&reserved_ports, size))
++		exit(1);
++
++	list_for_each_entry(sk, &cpt_tcp_repair_sockets, rlist)
++		add_reserved_ports(sk);
++
++	write_reserved_ports(RESERVED_PORTS_PATH);
++
++	free(reserved_ports);
++	reserved_ports = NULL;
++}
+diff --git a/criu/sk-tcp.c b/criu/sk-tcp.c
+index 0afecd2..38889d7 100644
+--- a/criu/sk-tcp.c
++++ b/criu/sk-tcp.c
+@@ -30,7 +30,7 @@
+ #undef LOG_PREFIX
+ #define LOG_PREFIX "tcp: "
+ 
+-static LIST_HEAD(cpt_tcp_repair_sockets);
++LIST_HEAD(cpt_tcp_repair_sockets);
+ static LIST_HEAD(rst_tcp_repair_sockets);
+ 
+ static int lock_connection(struct inet_sk_desc *sk)
+-- 
+2.34.1
+

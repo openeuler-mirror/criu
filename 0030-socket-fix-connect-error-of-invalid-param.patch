@@ -1,0 +1,93 @@
+From 8afde209d2a9245d902eabe40ca7c514aeb6ee9a Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Wed, 19 May 2021 21:56:16 +0800
+Subject: [PATCH 30/72] socket: fix connect error of invalid param
+
+Fix connect error of invalid param during module upgrade.
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/21
+Signed-off-by: Xiaoguang Li <lixiaoguang2@huawei.com>
+Signed-off-by: fu.lin <fu.lin10@huawei.com>
+---
+ criu/include/sockets.h |  1 +
+ criu/sk-inet.c         | 13 +++++++++++--
+ criu/sockets.c         |  5 ++++-
+ 3 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/criu/include/sockets.h b/criu/include/sockets.h
+index 3e8f3d6..2391b48 100644
+--- a/criu/include/sockets.h
++++ b/criu/include/sockets.h
+@@ -27,6 +27,7 @@ struct socket_desc {
+ extern int dump_socket(struct fd_parms *p, int lfd, FdinfoEntry *);
+ extern int dump_socket_opts(int sk, SkOptsEntry *soe);
+ extern int restore_socket_opts(int sk, SkOptsEntry *soe);
++extern int restore_bound_opts(int sk, SkOptsEntry *soe);
+ extern void release_skopts(SkOptsEntry *);
+ extern int restore_prepare_socket(int sk);
+ extern void preload_socket_modules(void);
+diff --git a/criu/sk-inet.c b/criu/sk-inet.c
+index e52b198..05048c8 100644
+--- a/criu/sk-inet.c
++++ b/criu/sk-inet.c
+@@ -100,15 +100,20 @@ static void show_one_inet(const char *act, const struct inet_sk_desc *sk)
+ static void show_one_inet_img(const char *act, const InetSkEntry *e)
+ {
+ 	char src_addr[INET_ADDR_LEN] = "<unknown>";
++	char dst_addr[INET_ADDR_LEN] = "<unknown>";
+ 
+ 	if (inet_ntop(e->family, (void *)e->src_addr, src_addr, INET_ADDR_LEN) == NULL) {
+ 		pr_perror("Failed to translate address");
+ 	}
++	if (inet_ntop(e->family, (void *)e->dst_addr, dst_addr,
++		      INET_ADDR_LEN) == NULL) {
++		 pr_perror("Failed to translate address");
++	}
+ 
+ 	pr_debug("\t%s: family %-10s type %-14s proto %-16s port %d "
+-		 "state %-16s src_addr %s\n",
++		 "state %-16s src_addr %s dst_addr %s\n",
+ 		 act, ___socket_family_name(e->family), ___socket_type_name(e->type), ___socket_proto_name(e->proto),
+-		 e->src_port, ___tcp_state_name(e->state), src_addr);
++		 e->src_port, ___tcp_state_name(e->state), src_addr, dst_addr);
+ }
+ 
+ static int can_dump_ipproto(unsigned int ino, int proto, int type)
+@@ -852,6 +857,10 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
+ 	if (restore_opt(sk, SOL_SOCKET, SO_REUSEPORT, &yes))
+ 		goto err;
+ 
++	if(restore_bound_opts(sk, ie->opts) < 0){
++		goto err;
++	}
++
+ 	if (tcp_connection(ie)) {
+ 		if (!opts.tcp_established_ok && !opts.tcp_close) {
+ 			pr_err("Connected TCP socket in image\n");
+diff --git a/criu/sockets.c b/criu/sockets.c
+index 9426b5b..2ddf85e 100644
+--- a/criu/sockets.c
++++ b/criu/sockets.c
+@@ -586,7 +586,6 @@ int restore_socket_opts(int sk, SkOptsEntry *soe)
+ 	tv.tv_usec = soe->so_rcv_tmo_usec;
+ 	ret |= restore_opt(sk, SOL_SOCKET, SO_RCVTIMEO, &tv);
+ 
+-	ret |= restore_bound_dev(sk, soe);
+ 	ret |= restore_socket_filter(sk, soe);
+ 
+ 	/* The restore of SO_REUSEADDR depends on type of socket */
+@@ -594,6 +593,10 @@ int restore_socket_opts(int sk, SkOptsEntry *soe)
+ 	return ret;
+ }
+ 
++int restore_bound_opts(int sk, SkOptsEntry *soe){
++	return restore_bound_dev(sk, soe);
++}
++
+ int do_dump_opt(int sk, int level, int name, void *val, int len)
+ {
+ 	socklen_t aux = len;
+-- 
+2.34.1
+

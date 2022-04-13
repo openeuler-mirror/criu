@@ -1,0 +1,774 @@
+From 47412ba0d9ce6283071973387bf5b34bf876bb9a Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Wed, 1 Dec 2021 09:44:07 +0800
+Subject: [PATCH 54/72] ptrace: trace specific syscall
+
+criu use `ptrace(PTRACE_SYSCALL)` to watch whether the tracee steps in
+correct status, it isn't necessory to stop tracee at every syscall.
+Therefore, customizing `ptrace(PTRACE_SYSCALL_NR)` to make tracee stop at
+the specific syscall can save time (1000 threads consume about 140ms).
+
+ptrace syntax:
+    long ptrace(PTRACE_SYSCALL_NR, pid_t pid, void *addr, void *data);
+
+The argument `addr` is unused in original `ptrace(PTRACE_SYSCALL)`,
+Here `ptrace(PTRACE_SYSCALL_NR)` use  `addr` parameter to give the
+specific sysno which is wanted to trace.
+
+use `criu check` to generate `/run/criu.kdat` before the first usage of
+criu, or auto-check during `criu {dump, restore}`.
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/25
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ compel/Makefile              |   1 +
+ compel/include/uapi/bisect.h |  30 +++++++
+ compel/include/uapi/infect.h |  15 +++-
+ compel/src/lib/bisect.c      |  92 +++++++++++++++++++
+ compel/src/lib/infect.c      | 167 ++++++++++++++++++++++++++++++++---
+ criu/cr-dump.c               |   2 +-
+ criu/cr-restore.c            |  97 +++++++++++++++++++-
+ criu/include/kerndat.h       |   1 +
+ criu/kerndat.c               |  61 +++++++++++++
+ 9 files changed, 450 insertions(+), 16 deletions(-)
+ create mode 100644 compel/include/uapi/bisect.h
+ create mode 100644 compel/src/lib/bisect.c
+
+diff --git a/compel/Makefile b/compel/Makefile
+index b79aee6..2168a26 100644
+--- a/compel/Makefile
++++ b/compel/Makefile
+@@ -27,6 +27,7 @@ lib-y			+= src/lib/infect-rpc.o
+ lib-y			+= src/lib/infect-util.o
+ lib-y			+= src/lib/infect.o
+ lib-y			+= src/lib/ptrace.o
++lib-y			+= src/lib/bisect.o
+ 
+ ifeq ($(ARCH),x86)
+ lib-y			+= arch/$(ARCH)/src/lib/thread_area.o
+diff --git a/compel/include/uapi/bisect.h b/compel/include/uapi/bisect.h
+new file mode 100644
+index 0000000..55ebcbd
+--- /dev/null
++++ b/compel/include/uapi/bisect.h
+@@ -0,0 +1,30 @@
++#ifndef __COMPEL_BISECT_H__
++#define __COMPEL_BISECT_H__
++
++#include <sys/types.h>
++
++enum tf {
++	TRACE_INTERRUPT,
++	TRACE_SYSCALL_ENTER,
++	TRACE_SYSCALL_EXIT,
++};
++
++struct trace_flag {
++	pid_t key;
++	enum tf flag;
++};
++
++struct bisect_meta {
++	int size;
++	int used;
++	void *data;	/* data pointer array */
++	void *__data;	/* data array */
++};
++
++struct trace_flag *tf_bisect(struct bisect_meta *meta, pid_t key);
++struct trace_flag *tf_insert(struct bisect_meta *meta, pid_t key);
++int tf_create(struct bisect_meta *meta, int len);
++void tf_destroy(struct bisect_meta *meta);
++void tf_clear(struct bisect_meta *meta);
++
++#endif /* __COMPEL_BISECT_H__ */
+diff --git a/compel/include/uapi/infect.h b/compel/include/uapi/infect.h
+index 389878e..a23782e 100644
+--- a/compel/include/uapi/infect.h
++++ b/compel/include/uapi/infect.h
+@@ -8,11 +8,16 @@
+ #include <compel/ksigset.h>
+ #include <compel/handle-elf.h>
+ #include <compel/task-state.h>
++#include <compel/bisect.h>
+ 
+ #include "common/compiler.h"
+ 
+ #define PARASITE_START_AREA_MIN (4096)
+ 
++#ifndef PTRACE_SYSCALL_NR
++# define PTRACE_SYSCALL_NR	0xff00
++#endif
++
+ extern int __must_check compel_interrupt_task(int pid);
+ 
+ struct seize_task_status {
+@@ -41,7 +46,7 @@ extern int __must_check compel_infect(struct parasite_ctl *ctl, unsigned long nr
+ extern struct parasite_thread_ctl __must_check *compel_prepare_thread(struct parasite_ctl *ctl, int pid);
+ extern void compel_release_thread(struct parasite_thread_ctl *);
+ 
+-extern int __must_check compel_stop_daemon(struct parasite_ctl *ctl);
++extern int __must_check compel_stop_daemon(struct parasite_ctl *ctl, bool customize);
+ extern int __must_check compel_cure_remote(struct parasite_ctl *ctl);
+ extern int __must_check compel_cure_local(struct parasite_ctl *ctl);
+ extern int __must_check compel_cure(struct parasite_ctl *ctl);
+@@ -83,6 +88,14 @@ extern int __must_check compel_stop_pie(pid_t pid, void *addr, enum trace_flags
+ 
+ extern int __must_check compel_unmap(struct parasite_ctl *ctl, unsigned long addr);
+ 
++extern int __must_check compel_stop_on_syscall_customize(int tasks,
++		const int sys_nr, const int exit_sys_nr, struct bisect_meta *meta);
++
++extern int __must_check compel_stop_pie_customize(pid_t pid,
++		const int sys_nr, struct trace_flag *tf);
++
++extern int __must_check compel_unmap_customize(struct parasite_ctl *ctl, unsigned long addr);
++
+ extern int compel_mode_native(struct parasite_ctl *ctl);
+ 
+ extern k_rtsigset_t *compel_task_sigmask(struct parasite_ctl *ctl);
+diff --git a/compel/src/lib/bisect.c b/compel/src/lib/bisect.c
+new file mode 100644
+index 0000000..807a5a9
+--- /dev/null
++++ b/compel/src/lib/bisect.c
+@@ -0,0 +1,92 @@
++#include <stddef.h>
++
++#include "log.h"
++#include "common/xmalloc.h"
++#include "bisect.h"
++
++struct trace_flag *tf_bisect(struct bisect_meta *meta, pid_t key)
++{
++	struct trace_flag **tfs = meta->data;
++	int lo = 0, hi = meta->used, mid;
++
++	if (meta->used <= 0)
++		return NULL;
++
++	while (lo < hi) {
++		mid = (int)((lo + hi) / 2);
++		if (tfs[mid]->key == key) {
++			return tfs[mid];
++		} else if (tfs[mid]->key > key) {
++			hi = mid;
++		} else {
++			lo = mid + 1;
++		}
++	}
++
++	return NULL;
++}
++
++/* used in cr-restore */
++struct trace_flag *tf_insert(struct bisect_meta *meta, pid_t key)
++{
++	struct trace_flag **tfs = meta->data;
++	struct trace_flag *tf = &((struct trace_flag *)meta->__data)[meta->used];
++	int i = 0, j = 0;
++
++	if (meta->used == meta->size)
++		return NULL;
++
++	for (i = 0; i < meta->used; i++) {
++		if (tfs[i]->key >= key) /* impossible condition: `tfs[i]->key == key` */
++			break;
++	}
++
++	j = meta->used;
++	meta->used += 1;
++
++	while (j > i) {
++		tfs[j] = tfs[j-1];
++		j -= 1;
++	}
++
++	tfs[i] = tf;
++	tf->key = key;
++
++	return tf;
++}
++
++int tf_create(struct bisect_meta *meta, int len)
++{
++	struct trace_flag *tfs;
++	struct trace_flag **tfs_ptr;
++
++	tfs = xzalloc(sizeof(*tfs) * len);
++	if (tfs == NULL)
++		return -1;
++
++	tfs_ptr = xmalloc(sizeof(*tfs_ptr) * len);
++	if (tfs_ptr == NULL)
++		goto err;
++
++	meta->size = len;
++	meta->used = 0;
++	meta->__data = tfs;
++	meta->data = tfs_ptr;
++
++	return 0;
++err:
++	xfree(tfs);
++	return -1;
++}
++
++void tf_destroy(struct bisect_meta *meta)
++{
++	xfree(meta->__data);
++	xfree(meta->data);
++}
++
++void tf_clear(struct bisect_meta *meta)
++{
++	meta->used = 0;
++	__builtin_memset(meta->data, 0, sizeof(struct trace_flag **)*meta->size);
++}
+diff --git a/compel/src/lib/infect.c b/compel/src/lib/infect.c
+index 6a13cc1..f9b8832 100644
+--- a/compel/src/lib/infect.c
++++ b/compel/src/lib/infect.c
+@@ -449,7 +449,7 @@ static int restore_child_handler(struct parasite_ctl *ctl)
+ }
+ 
+ static int parasite_run(pid_t pid, int cmd, unsigned long ip, void *stack, user_regs_struct_t *regs,
+-			struct thread_ctx *octx)
++			struct thread_ctx *octx, void *addr)
+ {
+ 	k_rtsigset_t block;
+ 
+@@ -470,7 +470,7 @@ static int parasite_run(pid_t pid, int cmd, unsigned long ip, void *stack, user_
+ 		goto err_regs;
+ 	}
+ 
+-	if (ptrace(cmd, pid, NULL, NULL)) {
++	if (ptrace(cmd, pid, addr, NULL)) {
+ 		pr_perror("Can't run parasite at %d", pid);
+ 		goto err_cont;
+ 	}
+@@ -575,7 +575,7 @@ int compel_execute_syscall(struct parasite_ctl *ctl, user_regs_struct_t *regs, c
+ 		return -1;
+ 	}
+ 
+-	err = parasite_run(pid, PTRACE_CONT, ctl->ictx.syscall_ip, 0, regs, &ctl->orig);
++	err = parasite_run(pid, PTRACE_CONT, ctl->ictx.syscall_ip, 0, regs, &ctl->orig, NULL);
+ 	if (!err)
+ 		err = parasite_trap(ctl, pid, regs, &ctl->orig, false);
+ 
+@@ -592,7 +592,7 @@ int compel_run_at(struct parasite_ctl *ctl, unsigned long ip, user_regs_struct_t
+ 	user_regs_struct_t regs = ctl->orig.regs;
+ 	int ret;
+ 
+-	ret = parasite_run(ctl->rpid, PTRACE_CONT, ip, 0, &regs, &ctl->orig);
++	ret = parasite_run(ctl->rpid, PTRACE_CONT, ip, 0, &regs, &ctl->orig, NULL);
+ 	if (!ret)
+ 		ret = parasite_trap(ctl, ctl->rpid, ret_regs ? ret_regs : &regs, &ctl->orig, false);
+ 	return ret;
+@@ -641,7 +641,7 @@ static int parasite_init_daemon(struct parasite_ctl *ctl)
+ 		goto err;
+ 
+ 	regs = ctl->orig.regs;
+-	if (parasite_run(pid, PTRACE_CONT, ctl->parasite_ip, ctl->rstack, &regs, &ctl->orig))
++	if (parasite_run(pid, PTRACE_CONT, ctl->parasite_ip, ctl->rstack, &regs, &ctl->orig, NULL))
+ 		goto err;
+ 
+ 	futex_wait_while_eq(&args->daemon_connected, 0);
+@@ -1303,7 +1303,7 @@ static bool task_in_parasite(struct parasite_ctl *ctl, user_regs_struct_t *regs)
+ 	return addr >= ctl->remote_map && addr < ctl->remote_map + ctl->map_length;
+ }
+ 
+-static int parasite_fini_seized(struct parasite_ctl *ctl)
++static int parasite_fini_seized(struct parasite_ctl *ctl, bool customize)
+ {
+ 	pid_t pid = ctl->rpid;
+ 	user_regs_struct_t regs;
+@@ -1348,6 +1348,34 @@ static int parasite_fini_seized(struct parasite_ctl *ctl)
+ 	if (ret)
+ 		return -1;
+ 
++	/* use customize ptrace */
++	if (customize) {
++		struct trace_flag tf = { .key = pid, .flag = TRACE_SYSCALL_ENTER };
++		struct trace_flag *tf_ptr[] = { &tf };
++		struct bisect_meta meta = {
++			.size = 1,
++			.used = 1,
++			.__data = &tf,
++			.data = tf_ptr,
++	        };
++
++		ret = compel_stop_pie_customize(pid, __NR(rt_sigreturn, 0), &tf);
++		if (ret < 0)
++			return ret;
++
++	        /* The process is going to execute the required syscall, the
++	         * original syscall should be forgot(set `-1`) in
++	         * `syscall_trace_enter()` handler in kernel when no other
++	         * else operation in tracer.
++	         *
++	         * Note: -1 means NO_SYSCALL which is defined in
++	         *  `arch/arm64/include/asm/ptrace.h`.
++	         */
++		return compel_stop_on_syscall_customize(1,
++							__NR(rt_sigreturn, 0),
++							-1, &meta);
++	}
++
+ 	/* Go to sigreturn as closer as we can */
+ 	ret = compel_stop_pie(pid, ctl->sigreturn_addr, &flag, ctl->ictx.flags & INFECT_NO_BREAKPOINTS);
+ 	if (ret < 0)
+@@ -1368,7 +1396,7 @@ static int parasite_fini_seized(struct parasite_ctl *ctl)
+ 	return 0;
+ }
+ 
+-int compel_stop_daemon(struct parasite_ctl *ctl)
++int compel_stop_daemon(struct parasite_ctl *ctl, bool customize)
+ {
+ 	if (ctl->daemonized) {
+ 		/*
+@@ -1378,7 +1406,7 @@ int compel_stop_daemon(struct parasite_ctl *ctl)
+ 		if (ctl->tsock < 0)
+ 			return -1;
+ 
+-		if (parasite_fini_seized(ctl)) {
++		if (parasite_fini_seized(ctl, customize)) {
+ 			close_safe(&ctl->tsock);
+ 			return -1;
+ 		}
+@@ -1394,7 +1422,7 @@ int compel_cure_remote(struct parasite_ctl *ctl)
+ 	long ret;
+ 	int err;
+ 
+-	if (compel_stop_daemon(ctl))
++	if (compel_stop_daemon(ctl, false))
+ 		return -1;
+ 
+ 	if (!ctl->remote_map)
+@@ -1461,7 +1489,7 @@ int compel_run_in_thread(struct parasite_thread_ctl *tctl, unsigned int cmd)
+ 
+ 	*ctl->cmd = cmd;
+ 
+-	ret = parasite_run(pid, PTRACE_CONT, ctl->parasite_ip, stack, &regs, octx);
++	ret = parasite_run(pid, PTRACE_CONT, ctl->parasite_ip, stack, &regs, octx, NULL);
+ 	if (ret == 0)
+ 		ret = parasite_trap(ctl, pid, &regs, octx, true);
+ 	if (ret == 0)
+@@ -1484,7 +1512,7 @@ int compel_unmap(struct parasite_ctl *ctl, unsigned long addr)
+ 	pid_t pid = ctl->rpid;
+ 	int ret = -1;
+ 
+-	ret = parasite_run(pid, PTRACE_SYSCALL, addr, ctl->rstack, &regs, &ctl->orig);
++	ret = parasite_run(pid, PTRACE_SYSCALL, addr, ctl->rstack, &regs, &ctl->orig, NULL);
+ 	if (ret)
+ 		goto err;
+ 
+@@ -1500,6 +1528,45 @@ err:
+ 	return ret;
+ }
+ 
++int compel_unmap_customize(struct parasite_ctl *ctl, unsigned long addr)
++{
++	user_regs_struct_t regs = ctl->orig.regs;
++	pid_t pid = ctl->rpid;
++	int ret = -1;
++	struct trace_flag tf = { .key = pid, .flag = TRACE_SYSCALL_ENTER };
++	struct trace_flag *tf_ptr[] = { &tf };
++	struct bisect_meta meta = {
++		.size = 1,
++		.used = 1,
++		.__data = &tf,
++		.data = tf_ptr,
++	};
++
++	/*
++	 * Here it parasite code. Unlike trap code `compel_stop_pie()`, it
++	 * won't let tracee forget the original syscall. In such way, tracer
++	 * just trace the syscall called by tracee. The log likes the following
++	 * if tracee forget syscall:
++	 *
++	 *   [  817.638332] set pid 1877 ptrace sysno 215
++	 *   [  817.638343] syscall_trace_enter: pid 1877 ptrace_sysno 0 current_sysno 215
++	 *   [  817.638363] (00.006280) Error (compel/src/lib/infect.c:1582): 1877 (native) is going to execute the syscall 215, required is 215
++	 *   [  817.638368] set pid 1877 ptrace sysno 0
++	 *   [  817.638402] syscall_trace_exit: pid 1877 ptrace_sysno 0 current_sysno 215
++	 */
++	ret = parasite_run(pid, PTRACE_SYSCALL_NR, addr, ctl->rstack, &regs,
++				&ctl->orig, (void *)(long)__NR(munmap, 0));
++	if (ret)
++		goto err;
++
++	ret = compel_stop_on_syscall_customize(1, __NR(munmap, 0), 0, &meta);
++
++	if (restore_thread_ctx(pid, &ctl->orig, false))
++		ret = -1;
++err:
++	return ret;
++}
++
+ int compel_stop_pie(pid_t pid, void *addr, enum trace_flags *tf, bool no_bp)
+ {
+ 	int ret;
+@@ -1535,6 +1602,17 @@ int compel_stop_pie(pid_t pid, void *addr, enum trace_flags *tf, bool no_bp)
+ 	return 0;
+ }
+ 
++int compel_stop_pie_customize(pid_t pid, const int sys_nr, struct trace_flag *tf)
++{
++	if (ptrace(PTRACE_SYSCALL_NR, pid, sys_nr, NULL)) {
++		pr_perror("Unable to restart the %d process", pid);
++		return -1;
++	}
++
++	tf->flag = TRACE_SYSCALL_ENTER;
++	return 0;
++}
++
+ static bool task_is_trapped(int status, pid_t pid)
+ {
+ 	if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP)
+@@ -1642,6 +1720,73 @@ int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat,
+ 	return 0;
+ }
+ 
++int compel_stop_on_syscall_customize(int tasks, const int sys_nr,
++	const int exit_sys_nr, struct bisect_meta *meta)
++{
++	struct trace_flag *tf;
++	user_regs_struct_t regs;
++	int status, ret;
++	pid_t pid;
++
++	while (tasks) {
++		pid = wait4(-1, &status, __WALL, NULL);
++		if (pid == -1) {
++			pr_perror("wait4 failed");
++			return -1;
++		}
++
++		tf = tf_bisect(meta, pid);
++		if (tf == NULL) {
++			pr_warn("Unexpected task %d, state %d signal %d: %s\n",
++					pid, WEXITSTATUS(status),
++					WTERMSIG(status), strsignal(WTERMSIG(status)));
++			continue;
++		}
++
++		if (!task_is_trapped(status, pid))
++			return -1;
++
++		switch (tf->flag) {
++			case TRACE_SYSCALL_ENTER:
++				pr_debug("%d was trapped\n", pid);
++				pr_debug("`- Expecting exit\n");
++
++				ret = ptrace_get_regs(pid, &regs);
++				if (ret) {
++					pr_perror("ptrace");
++					return -1;
++				}
++
++				if (is_required_syscall(&regs, pid, sys_nr, sys_nr)) {
++					ret = ptrace(PTRACE_SYSCALL_NR, pid, exit_sys_nr, NULL);
++					if (ret) {
++						pr_perror("ptrace");
++						return -1;
++					}
++					tf->flag = TRACE_SYSCALL_EXIT;
++				} else {
++					pr_warn("Impossible condition, check the system, try our best to restore...\n");
++					ret = ptrace(PTRACE_SYSCALL_NR, pid, sys_nr, NULL);
++					if (ret) {
++						pr_perror("ptrace");
++						return -1;
++					}
++				}
++				break;
++			case TRACE_SYSCALL_EXIT:
++				pr_debug("%d was stopped\n", pid);
++				tasks--;
++				break;
++
++			default:
++				pr_err("pid %d invalid status: %d\n", pid, tf->flag);
++				return -1;
++		}
++	}
++
++	return 0;
++}
++
+ int compel_mode_native(struct parasite_ctl *ctl)
+ {
+ 	return user_regs_native(&ctl->orig.regs);
+diff --git a/criu/cr-dump.c b/criu/cr-dump.c
+index ee826c0..9253e91 100644
+--- a/criu/cr-dump.c
++++ b/criu/cr-dump.c
+@@ -1708,7 +1708,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
+ 		goto err_cure;
+ 	}
+ 
+-	ret = compel_stop_daemon(parasite_ctl);
++	ret = compel_stop_daemon(parasite_ctl, kdat.has_customize_ptrace);
+ 	if (ret) {
+ 		pr_err("Can't stop daemon in parasite (pid: %d)\n", pid);
+ 		goto err_cure;
+diff --git a/criu/cr-restore.c b/criu/cr-restore.c
+index d19768d..b0b3d30 100644
+--- a/criu/cr-restore.c
++++ b/criu/cr-restore.c
+@@ -2181,6 +2181,64 @@ static int catch_tasks(bool root_seized, enum trace_flags *flag)
+ 	return 0;
+ }
+ 
++static int cache_tasks_customize(bool root_seized, struct bisect_meta *meta)
++{
++	struct pstree_item *item;
++	struct trace_flag *tf;
++
++	for_each_pstree_item(item) {
++		int status, i, ret;
++		pid_t pid;
++
++		if (!task_alive(item))
++			continue;
++
++		if (item->nr_threads == 1) {
++			item->threads[0].real = item->pid->real;
++		} else {
++			if (parse_threads(item->pid->real, &item->threads, &item->nr_threads))
++				return -1;
++		}
++
++		for (i = 0; i < item->nr_threads; i++) {
++			pid = item->threads[i].real;
++
++			if (ptrace(PTRACE_INTERRUPT, pid, 0, 0)) {
++				pr_perror("Can't interrupt the %d task", pid);
++				return -1;
++			}
++
++			tf = tf_insert(meta, pid);
++			if (tf == NULL) {
++				pr_err("Can't find trace flag for %d, used %d\n",
++						pid, meta->used);
++				return -1;
++			}
++			tf->flag = TRACE_INTERRUPT;
++		}
++
++		for (i = 0; i < item->nr_threads; i++) {
++			pid = wait4(-1, &status, __WALL, NULL);
++			
++			tf = tf_bisect(meta, pid);
++			if (tf == NULL) {
++				pr_err("Can't find trace flag for %d, used %d\n",
++						pid, meta->used);
++				return -1;
++			}
++
++			ret = compel_stop_pie_customize(pid,
++							__NR(rt_sigreturn, 0),
++							tf);
++			if (ret < 0)
++				return -1;
++
++		}
++	}
++
++	return 0;
++}
++
+ static int clear_breakpoints(void)
+ {
+ 	struct pstree_item *item;
+@@ -2207,6 +2265,7 @@ static void finalize_restore(void)
+ 		pid_t pid = item->pid->real;
+ 		struct parasite_ctl *ctl;
+ 		unsigned long restorer_addr;
++		int retval;
+ 
+ 		if (!task_alive(item))
+ 			continue;
+@@ -2217,7 +2276,12 @@ static void finalize_restore(void)
+ 			continue;
+ 
+ 		restorer_addr = (unsigned long)rsti(item)->munmap_restorer;
+-		if (compel_unmap(ctl, restorer_addr))
++		if (!kdat.has_customize_ptrace)
++			retval = compel_unmap(ctl, restorer_addr);
++		else
++			retval = compel_unmap_customize(ctl, restorer_addr);
++
++		if (retval)
+ 			pr_err("Failed to unmap restorer from %d\n", pid);
+ 
+ 		xfree(ctl);
+@@ -2333,11 +2397,18 @@ static void reap_zombies(void)
+ 
+ static int restore_root_task(struct pstree_item *init)
+ {
++	struct bisect_meta tfs_meta;
+ 	enum trace_flags flag = TRACE_ALL;
+ 	int ret, fd, mnt_ns_fd = -1;
+ 	int root_seized = 0;
+ 	struct pstree_item *item;
+ 
++	if (kdat.has_customize_ptrace
++			&& tf_create(&tfs_meta, task_entries->nr_threads) != 0) {
++		pr_err("Can't alloc memory, tf_create failed\n");
++		return -1;
++	}
++
+ 	ret = run_scripts(ACT_PRE_RESTORE);
+ 	if (ret != 0) {
+ 		pr_err("Aborting restore due to pre-restore script ret code %d\n", ret);
+@@ -2551,7 +2622,12 @@ skip_ns_bouncing:
+ 
+ 	timing_stop(TIME_RESTORE);
+ 
+-	if (catch_tasks(root_seized, &flag)) {
++	if (!kdat.has_customize_ptrace)
++		ret = catch_tasks(root_seized, &flag);
++	else
++		ret = cache_tasks_customize(root_seized, &tfs_meta);
++
++	if (ret) {
+ 		pr_err("Can't catch all tasks\n");
+ 		goto out_kill_network_unlocked;
+ 	}
+@@ -2561,7 +2637,15 @@ skip_ns_bouncing:
+ 
+ 	__restore_switch_stage(CR_STATE_COMPLETE);
+ 
+-	ret = compel_stop_on_syscall(task_entries->nr_threads, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1), flag);
++	if (!kdat.has_customize_ptrace) {
++		ret = compel_stop_on_syscall(task_entries->nr_threads,
++					     __NR(rt_sigreturn, 0),
++					     __NR(rt_sigreturn, 1), flag);
++	} else {
++		ret = compel_stop_on_syscall_customize(task_entries->nr_threads,
++						       __NR(rt_sigreturn, 0),
++						       -1, &tfs_meta);
++	}
+ 	if (ret) {
+ 		pr_err("Can't stop all tasks on rt_sigreturn\n");
+ 		goto out_kill_network_unlocked;
+@@ -2600,6 +2684,9 @@ skip_ns_bouncing:
+ 		reap_zombies();
+ 	}
+ 
++	if (kdat.has_customize_ptrace)
++		tf_destroy(&tfs_meta);
++
+ 	return 0;
+ 
+ out_kill_network_unlocked:
+@@ -2631,6 +2718,10 @@ out:
+ 	stop_usernsd();
+ 	__restore_switch_stage(CR_STATE_FAIL);
+ 	pr_err("Restoring FAILED.\n");
++
++	if (kdat.has_customize_ptrace)
++		tf_destroy(&tfs_meta);
++
+ 	return -1;
+ }
+ 
+diff --git a/criu/include/kerndat.h b/criu/include/kerndat.h
+index 3979939..8034db9 100644
+--- a/criu/include/kerndat.h
++++ b/criu/include/kerndat.h
+@@ -77,6 +77,7 @@ struct kerndat_s {
+ 	bool has_rseq;
+ 	bool has_ptrace_get_rseq_conf;
+ 	bool has_unix_sk_repair;
++	bool has_customize_ptrace;
+ };
+ 
+ extern struct kerndat_s kdat;
+diff --git a/criu/kerndat.c b/criu/kerndat.c
+index 6d6aac1..630814e 100644
+--- a/criu/kerndat.c
++++ b/criu/kerndat.c
+@@ -1289,6 +1289,66 @@ static void kerndat_has_unix_sk_repair(void)
+ 	return;
+ }
+ 
++static void kerndat_has_customize_ptrace(void)
++{
++	pid_t tracee = fork();
++	int status;
++	int retval;
++
++	if (tracee == 0) {
++		/* ensure */
++		prctl(PR_SET_PDEATHSIG, SIGKILL);
++
++		while (true)
++			sleep(1);
++	} else if (tracee > 0) {
++		pr_debug("fork task %d as tracee\n", tracee);
++		retval = ptrace(PTRACE_ATTACH, tracee, 0, 0);
++		if (retval < 0) {
++			pr_perror("Unexpect error from ptrace(PTRACE_ATTACH)");
++			return;
++		}
++
++		retval = wait4(-1, &status, __WALL, NULL);
++		if (retval == -1)
++			pr_perror("Unexpect error from wait");
++		else if (retval != tracee || !(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP))
++			pr_err("Task %d (expect %d) is unexpect, status: %d,"
++				       " stoped: %d signal: %d(%s)\n",
++					retval, tracee, status,
++					WIFSTOPPED(status), WSTOPSIG(status),
++					strsignal(WTERMSIG(status)));
++		else {
++			retval = ptrace(PTRACE_SYSCALL_NR, tracee, 0, 0);
++			if (retval == 0)
++				kdat.has_customize_ptrace = true;
++			else
++				pr_perror("Unexpect error from ptrace(PTRACE_SYSCALL_NR)");
++		}
++
++		if (kill(tracee, SIGKILL) != 0) {
++			pr_perror("kill tracee %d failed", tracee);
++			return;
++		}
++
++		/*
++		 * To prevent wait4 unexpect task when criu.kdat is generated
++		 * in dump process.
++		 */
++		retval = waitpid(tracee, &status, 0);
++		if (retval == -1)
++			pr_err("waitpid() failed");
++		else
++			pr_debug("tracee %d exited, status %d, signal %d(%s)\n",
++					WEXITSTATUS(status), WTERMSIG(status),
++					WTERMSIG(status), strsignal(WTERMSIG(status)));
++	} else {
++		pr_perror("Unexpected error from fork\n");
++	}
++
++	return;
++}
++
+ int kerndat_init(void)
+ {
+ 	int ret;
+@@ -1451,6 +1511,7 @@ int kerndat_init(void)
+ 	}
+ 
+ 	kerndat_has_unix_sk_repair();
++	kerndat_has_customize_ptrace();
+ 
+ 	kerndat_lsm();
+ 	kerndat_mmap_min_addr();
+-- 
+2.34.1
+

@@ -1,0 +1,193 @@
+From 58a8c9eb07c2cff6232c20f9a59edc634bb1e5e0 Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Wed, 19 May 2021 21:59:24 +0800
+Subject: [PATCH 32/72] task_exit_notify: add task exit notify mask method for
+ criu
+
+Add task exit notify mask method for criu during kernel module upgrade.
+
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/Makefile.crtools      |  1 +
+ criu/config.c              |  1 +
+ criu/cr-restore.c          | 10 ++++++++++
+ criu/crtools.c             |  1 +
+ criu/exit-notify.c         | 34 ++++++++++++++++++++++++++++++++++
+ criu/include/cr_options.h  |  1 +
+ criu/include/exit-notify.h | 10 ++++++++++
+ criu/seize.c               | 10 +++++++++-
+ 8 files changed, 67 insertions(+), 1 deletion(-)
+ create mode 100644 criu/exit-notify.c
+ create mode 100644 criu/include/exit-notify.h
+
+diff --git a/criu/Makefile.crtools b/criu/Makefile.crtools
+index 2e82912..65cc215 100644
+--- a/criu/Makefile.crtools
++++ b/criu/Makefile.crtools
+@@ -93,6 +93,7 @@ obj-y			+= timens.o
+ obj-y			+= pin-mem.o
+ obj-y			+= devname.o
+ obj-y			+= files-chr.o
++obj-y			+= exit-notify.o
+ obj-$(CONFIG_HAS_LIBBPF)	+= bpfmap.o
+ obj-$(CONFIG_COMPAT)	+= pie-util-vdso-elf32.o
+ CFLAGS_pie-util-vdso-elf32.o	+= -DCONFIG_VDSO_32
+diff --git a/criu/config.c b/criu/config.c
+index cf99fb1..bd0f84d 100644
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -703,6 +703,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		BOOL_OPT("with-notifier", &opts.with_notifier_kup),
+ 		BOOL_OPT("dump-char-dev", &opts.dump_char_dev),
+ 		BOOL_OPT("with-fd-cred", &opts.with_fd_cred),
++		BOOL_OPT("mask-exit-notify", &opts.mask_exit_notify),
+ 		{},
+ 	};
+ 
+diff --git a/criu/cr-restore.c b/criu/cr-restore.c
+index ac677a1..09f135b 100644
+--- a/criu/cr-restore.c
++++ b/criu/cr-restore.c
+@@ -82,6 +82,7 @@
+ #include "apparmor.h"
+ #include "pin-mem.h"
+ #include "notifier.h"
++#include "exit-notify.h"
+ 
+ #include "parasite-syscall.h"
+ #include "files-reg.h"
+@@ -1542,6 +1543,15 @@ static inline int fork_with_pid(struct pstree_item *item)
+ 		pr_debug("PID: real %d virt %d\n", item->pid->real, vpid(item));
+ 	}
+ 
++	if (opts.mask_exit_notify) {
++		int pid = ret;
++
++		pr_info("Start unmask exit notifier for pid %d\n", pid);
++		ret = mask_task_exit_notify(pid, false);
++		if (ret)
++			pr_err("Can't unmask exit notifier for pid %d\n", pid);
++	}
++
+ err_unlock:
+ 	if (!(ca.clone_flags & CLONE_NEWPID))
+ 		unlock_last_pid();
+diff --git a/criu/crtools.c b/criu/crtools.c
+index ed7bd99..1a41be4 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -454,6 +454,7 @@ usage:
+ 	       "  --dump-char-dev	Dump char dev files as normal file with repair cmd\n"
+ 	       \
+ 	       "  --with-fd-cred	Allow to make the restored process has the same cred\n"
++	       "  --mask-exit-notify	Mask task exit notify during dump and restore\n"
+ 	       "\n"
+ 	       "Check options:\n"
+ 	       "  Without options, \"criu check\" checks availability of absolutely required\n"
+diff --git a/criu/exit-notify.c b/criu/exit-notify.c
+new file mode 100644
+index 0000000..5c86724
+--- /dev/null
++++ b/criu/exit-notify.c
+@@ -0,0 +1,34 @@
++#include <fcntl.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <unistd.h>
++
++#include "exit-notify.h"
++#include "log.h"
++
++int mask_task_exit_notify(int pid, bool mask)
++{
++	int fd, retval;
++	char buf[PID_BUF_SIZE] = {0};
++
++	if (pid <= 0)
++		return -1;
++
++	snprintf(buf, PID_BUF_SIZE - 1, "%d", pid);
++	if (mask)
++		fd = open(MASK_EXIT_NOTIFY_DIR, O_WRONLY, 0);
++	else
++		fd = open(UNMASK_EXIT_NOTIFY_DIR, O_WRONLY, 0);
++
++	if (fd < 0) {
++		pr_err("open mask exit notify file fail\n");
++		return fd;
++	}
++
++	retval = write(fd, buf, PID_BUF_SIZE);
++	if (retval < 0)
++		pr_err("Write mask exit pid: %s fail\n", buf);
++	close(fd);
++
++	return retval < 0 ? -1 : 0;
++}
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index 1d6ddcf..26ae5b6 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -195,6 +195,7 @@ struct cr_options {
+ 	int with_notifier_kup;
+ 	int dump_char_dev;
+ 	int with_fd_cred;
++	int mask_exit_notify;
+ };
+ 
+ extern struct cr_options opts;
+diff --git a/criu/include/exit-notify.h b/criu/include/exit-notify.h
+new file mode 100644
+index 0000000..34f2c8d
+--- /dev/null
++++ b/criu/include/exit-notify.h
+@@ -0,0 +1,10 @@
++#ifndef __CRIU_EXIT_NOTIFY_H__
++#define __CRIU_EXIT_NOTIFY_H__
++
++#define PID_BUF_SIZE		32
++#define MASK_EXIT_NOTIFY_DIR	"/sys/kernel/mask_exit_notify"
++#define UNMASK_EXIT_NOTIFY_DIR	"/sys/kernel/unmask_exit_notify"
++
++int mask_task_exit_notify(int pid, bool mask);
++
++#endif /* __CRIU_EXIT_NOTIFY_H__ */
+diff --git a/criu/seize.c b/criu/seize.c
+index 8a35c3c..1e127ff 100644
+--- a/criu/seize.c
++++ b/criu/seize.c
+@@ -24,6 +24,8 @@
+ #include "xmalloc.h"
+ #include "util.h"
+ #include "pin-mem.h"
++#include "mem.h"
++#include "exit-notify.h"
+ 
+ #define NR_ATTEMPTS 5
+ 
+@@ -636,7 +638,7 @@ free:
+ 
+ static void unseize_task_and_threads(const struct pstree_item *item, int st)
+ {
+-	int i;
++	int i, ret;
+ 
+ 	if (item->pid->state == TASK_DEAD)
+ 		return;
+@@ -646,6 +648,12 @@ static void unseize_task_and_threads(const struct pstree_item *item, int st)
+ 			dump_task_special_pages(item->threads[i].real);
+ 	}
+ 
++	if (opts.mask_exit_notify && (st == TASK_DEAD)) {
++		ret = mask_task_exit_notify(item->threads[0].real, true);
++		if (ret)
++			pr_err("mask exit notify for %d fail.\n", item->threads[0].real);
++	}
++
+ 	/*
+ 	 * The st is the state we want to switch tasks into,
+ 	 * the item->state is the state task was in when we seized one.
+-- 
+2.34.1
+

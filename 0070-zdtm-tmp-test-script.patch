@@ -1,0 +1,59 @@
+From a4f00a225ebfed401aed49956eefad391071d0ce Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Thu, 17 Feb 2022 11:02:08 +0800
+Subject: [PATCH 70/72] zdtm: tmp test script
+
+---
+ test/jenkins/criu-lib.sh  |  2 +-
+ test/jenkins/criu-test.sh | 26 ++++++++++++++++++++++++++
+ 2 files changed, 27 insertions(+), 1 deletion(-)
+ create mode 100644 test/jenkins/criu-test.sh
+
+diff --git a/test/jenkins/criu-lib.sh b/test/jenkins/criu-lib.sh
+index 72d41b5..89dc936 100644
+--- a/test/jenkins/criu-lib.sh
++++ b/test/jenkins/criu-lib.sh
+@@ -15,7 +15,7 @@ function prep()
+ 
+ 	ulimit -c unlimited &&
+ 	export CFLAGS=-g
+-	git clean -dfx &&
++#	git clean -dfx &&
+ 	make -j 4 &&
+ 	make -j 4 -C test/zdtm/ &&
+ 	make -C test zdtm_ct &&
+diff --git a/test/jenkins/criu-test.sh b/test/jenkins/criu-test.sh
+new file mode 100644
+index 0000000..3035f21
+--- /dev/null
++++ b/test/jenkins/criu-test.sh
+@@ -0,0 +1,26 @@
++#!/bin/bash
++
++set -e
++source `dirname $0`/criu-lib.sh
++prep
++
++rm -rf /var/run/criu.kdat
++
++make zdtm
++
++if [ -z $(grep 58467 /etc/group) ]; then
++    groupadd -g 58467 zdtm
++fi
++if [ -z $(grep 58467 /etc/passwd) ]; then
++    useradd -u 18943  -g 58467 zdtm
++fi
++
++#./test/zdtm.py run --all --keep-going --report report -f h --ignore-taint --parallel 1 --load-pinmem-dev || fail
++
++#./test/zdtm.py run -t zdtm/static/del_standalone_un --keep-going -f h --ignore-taint --parallel 1 --load-pinmem-dev --keep-img always
++
++./test/zdtm.py run -t zdtm/customization/chardev00 -t zdtm/customization/notifier00 --keep-going -f h --ignore-taint --parallel 1 --load-pinmem-dev --keep-img always
++
++#./test/zdtm.py run -t zdtm/static/socket-tcp-nfconntrack --join-ns --keep-going --ignore-taint --parallel 1 --load-pinmem-dev --keep-img always
++
++./test/zdtm.py run -t zdtm/customization/tcp00 --keep-going -f h --ignore-taint --parallel 1 --load-pinmem-dev --keep-img always
+-- 
+2.34.1
+

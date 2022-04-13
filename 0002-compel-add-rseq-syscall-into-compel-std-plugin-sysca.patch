@@ -1,18 +1,18 @@
-From ee46b1b5755eacf3be02a67934f0dc690293745b Mon Sep 17 00:00:00 2001
+From dc6dbe893f7a8b644b655a56e4a0edfb854c577f Mon Sep 17 00:00:00 2001
 From: bb-cat <ningyu9@huawei.com>
 Date: Wed, 2 Mar 2022 13:28:51 +0800
-Subject: [PATCH 02/16] compel: add rseq syscall into compel std plugin syscall
+Subject: [PATCH 02/72] compel: add rseq syscall into compel std plugin syscall
  tables Add rseq syscall numbers for: arm/aarch64, mips64, ppc64le, s390,
  x86_64/x86
 
 Signed-off-by: Alexander Mikhalitsyn <alexander.mikhalitsyn@virtuozzo.com>
 ---
- compel/arch/arm/plugins/std/syscalls/syscall.def     | 1 +
- compel/arch/mips/plugins/std/syscalls/syscall_64.tbl | 1 +
- .../compel/arch/ppc64/plugins/std/syscalls/syscall-ppc64.tbl     | 1 +
- .../compel/arch/s390/plugins/std/syscalls/syscall-s390.tbl       | 1 +
- compel/arch/x86/plugins/std/syscalls/syscall_32.tbl  | 1 +
- compel/arch/x86/plugins/std/syscalls/syscall_64.tbl  | 1 +
+ compel/arch/arm/plugins/std/syscalls/syscall.def         | 1 +
+ compel/arch/mips/plugins/std/syscalls/syscall_64.tbl     | 1 +
+ compel/arch/ppc64/plugins/std/syscalls/syscall-ppc64.tbl | 1 +
+ compel/arch/s390/plugins/std/syscalls/syscall-s390.tbl   | 1 +
+ compel/arch/x86/plugins/std/syscalls/syscall_32.tbl      | 1 +
+ compel/arch/x86/plugins/std/syscalls/syscall_64.tbl      | 1 +
  6 files changed, 6 insertions(+)
 
 diff --git a/compel/arch/arm/plugins/std/syscalls/syscall.def b/compel/arch/arm/plugins/std/syscalls/syscall.def
@@ -70,5 +70,5 @@ index c1d119d..323fab1 100644
  __NR_pidfd_getfd		438		sys_pidfd_getfd		(int pidfd, int targetfd, unsigned int flags)
 +__NR_rseq       		334		sys_rseq		(void *rseq, uint32_t rseq_len, int flags, uint32_t sig)
 -- 
-2.30.0
+2.34.1
 

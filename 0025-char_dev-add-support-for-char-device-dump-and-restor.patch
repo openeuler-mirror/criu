@@ -1,0 +1,784 @@
+From 2eebb9de411333628ce8fc5894f072b6ed6179e0 Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Wed, 19 May 2021 21:55:34 +0800
+Subject: [PATCH 25/72] char_dev: add support for char device dump and restore
+
+Add support for char device dump and restore during module upgrade.
+
+`/sys/kernel/repairing_device` provides the char device whiltelist
+with `IOCTL_CMD_{NEEDREPAIR, REPAIR}` command besides the internal
+device list.
+The device modules could use `mures_{add, del}_devname()` to add, or
+delete the char device whitelist dynamically.
+
+Signed-off-by: Xiaoguang Li <lixiaoguang2@huawei.com>
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/Makefile.crtools        |   2 +
+ criu/config.c                |   1 +
+ criu/cr-dump.c               |   4 ++
+ criu/cr-restore.c            |   4 +-
+ criu/crtools.c               |   2 +
+ criu/devname.c               | 130 +++++++++++++++++++++++++++++++++++
+ criu/files-chr.c             | 104 ++++++++++++++++++++++++++++
+ criu/files-reg.c             |   6 +-
+ criu/files.c                 |  93 ++++++++++++++++++++++++-
+ criu/include/cr_options.h    |   1 +
+ criu/include/files-chr.h     |  25 +++++++
+ criu/include/files.h         |   6 ++
+ criu/include/image-desc.h    |   1 +
+ criu/include/image.h         |   1 +
+ criu/include/protobuf-desc.h |   1 +
+ criu/mem.c                   |   7 +-
+ criu/proc_parse.c            |  21 +++++-
+ images/Makefile              |   1 +
+ images/chr.proto             |  12 ++++
+ images/fdinfo.proto          |   3 +
+ 20 files changed, 417 insertions(+), 8 deletions(-)
+ create mode 100644 criu/devname.c
+ create mode 100644 criu/files-chr.c
+ create mode 100644 criu/include/files-chr.h
+ create mode 100644 images/chr.proto
+
+diff --git a/criu/Makefile.crtools b/criu/Makefile.crtools
+index 98c4135..2e82912 100644
+--- a/criu/Makefile.crtools
++++ b/criu/Makefile.crtools
+@@ -91,6 +91,8 @@ obj-y			+= pie-util-vdso.o
+ obj-y			+= vdso.o
+ obj-y			+= timens.o
+ obj-y			+= pin-mem.o
++obj-y			+= devname.o
++obj-y			+= files-chr.o
+ obj-$(CONFIG_HAS_LIBBPF)	+= bpfmap.o
+ obj-$(CONFIG_COMPAT)	+= pie-util-vdso-elf32.o
+ CFLAGS_pie-util-vdso-elf32.o	+= -DCONFIG_VDSO_32
+diff --git a/criu/config.c b/criu/config.c
+index 5d1cff6..03cad66 100644
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -701,6 +701,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		{ "network-lock", required_argument, 0, 1100 },
+ 		BOOL_OPT("use-fork-pid", &opts.use_fork_pid),
+ 		BOOL_OPT("with-notifier", &opts.with_notifier_kup),
++		BOOL_OPT("dump-char-dev", &opts.dump_char_dev),
+ 		{},
+ 	};
+ 
+diff --git a/criu/cr-dump.c b/criu/cr-dump.c
+index 50a2f9b..fd17413 100644
+--- a/criu/cr-dump.c
++++ b/criu/cr-dump.c
+@@ -88,6 +88,7 @@
+ #include "asm/dump.h"
+ #include "pin-mem.h"
+ #include "notifier.h"
++#include "files-chr.h"
+ 
+ /*
+  * Architectures can overwrite this function to restore register sets that
+@@ -1880,6 +1881,9 @@ int cr_pre_dump_tasks(pid_t pid)
+ 	 */
+ 	rlimit_unlimit_nofile();
+ 
++	if (opts.dump_char_dev && parse_devname() < 0)
++		goto err;
++
+ 	root_item = alloc_pstree_item();
+ 	if (!root_item)
+ 		goto err;
+diff --git a/criu/cr-restore.c b/criu/cr-restore.c
+index b805265..2904a75 100644
+--- a/criu/cr-restore.c
++++ b/criu/cr-restore.c
+@@ -332,11 +332,11 @@ static int root_prepare_shared(void)
+ 		if (pi->pid->state == TASK_HELPER)
+ 			continue;
+ 
+-		ret = prepare_mm_pid(pi);
++		ret = prepare_fd_pid(pi);
+ 		if (ret < 0)
+ 			break;
+ 
+-		ret = prepare_fd_pid(pi);
++		ret = prepare_mm_pid(pi);
+ 		if (ret < 0)
+ 			break;
+ 
+diff --git a/criu/crtools.c b/criu/crtools.c
+index 1d08620..dc6d603 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -451,6 +451,8 @@ usage:
+ 	       "  --use-fork-pid	Allow to restore task pid by setting fork pid of task struct.\n"
+ 	       "  --with-notifier	Allow to checkpoint/restore kup notifier chain.\n"
+ 	       "			This feature needs the kernel assistance.\n"
++	       "  --dump-char-dev	Dump char dev files as normal file with repair cmd\n"
++	       \
+ 	       "\n"
+ 	       "Check options:\n"
+ 	       "  Without options, \"criu check\" checks availability of absolutely required\n"
+diff --git a/criu/devname.c b/criu/devname.c
+new file mode 100644
+index 0000000..5f6fbed
+--- /dev/null
++++ b/criu/devname.c
+@@ -0,0 +1,130 @@
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "log.h"
++#include "common/xmalloc.h"
++
++#define REPAIRING_DEVICE_FILE	"/sys/kernel/repairing_device"
++#define ASCII_SIZE	128
++
++static void *root_bucket[ASCII_SIZE];
++
++static int insert_devname_internal(void *bucket[], const char *name)
++{
++	void *new = NULL;
++	int idx = *name;
++
++	if (bucket[idx] != NULL)
++		return insert_devname_internal(bucket[idx], name+1);
++	else if (idx == '\0') {
++		new = xmalloc(sizeof(void *));
++		if (!new) {
++			pr_perror("alloc devname failed\n");
++			return -1;
++		}
++		bucket[idx] = new;
++		return 0;
++	} else {
++		new = xmalloc(sizeof(void *) * ASCII_SIZE);
++		if (!new) {
++			pr_perror("alloc devname failed\n");
++			return -1;
++		}
++		memset(new, 0, sizeof(void *) * ASCII_SIZE);
++		bucket[idx] = new;
++		return insert_devname_internal(bucket[idx], name+1);
++	}
++}
++
++int insert_devname(const char *devname)
++{
++	if (devname == NULL || *devname == '\0') // ignore
++		return 0;
++
++	pr_debug("insert device '%s'\n", devname);
++	return insert_devname_internal(root_bucket, devname);
++}
++
++int parse_devname(void)
++{
++	int retval = -1;
++	char *line = NULL;
++	size_t len = 0;
++	ssize_t nread = 0;
++	FILE *fp = NULL;
++
++	fp = fopen(REPAIRING_DEVICE_FILE, "r");
++	if (fp == NULL) {
++		pr_info("Unable to open %s, downgrade to use internal whitelist\n",
++				REPAIRING_DEVICE_FILE);
++		return 0;
++	}
++
++	while ((nread = getline(&line, &len, fp)) != -1) {
++		if (nread <= 1) // ignore empty string
++			continue;
++
++		line[nread-1] = '\0'; // drop '\n'
++		retval = insert_devname(line);
++		if (retval != 0)
++			goto out;
++	}
++	retval = 0;
++
++out:
++	free(line);
++	fclose(fp);
++	return retval;
++}
++
++static const char *steal_devname(const char *name, ssize_t len)
++{
++	ssize_t off = len;
++
++	for (off -= 1; off > 0; off--) {
++		if (name[off] == '/')
++			break;
++	}
++
++	return name + off + 1;
++}
++
++static bool find_devname_internal(void *bucket[], const char *name)
++{
++	int idx = *name;
++
++	if (*name == '\0' && bucket[idx] != NULL)
++		return true;
++	else if (bucket[idx] == NULL)
++		return false;
++	else {
++		return find_devname_internal(bucket[idx], name+1);
++	}
++}
++
++bool find_devname(const char *name)
++{
++	const char *devname;
++	size_t len = 0;
++	bool found = false;
++
++	if (name == NULL)
++		return false;
++	else if ((len = strlen(name)) == 0)
++		return false;
++
++	devname = steal_devname(name, len);
++	found = find_devname_internal(root_bucket, devname);
++
++	pr_debug("device '%s' (original name '%s') %s found in %s\n",
++			devname, name, found ? "is" : "isn't", REPAIRING_DEVICE_FILE);
++
++	/* Compatible with the old version, there are still `strstr` branch in the following */
++	found |= (strstr(name, "uverbs") != NULL
++			|| strstr(name, "rdma_cm") != NULL
++			|| strstr(name, "umad") != NULL);
++
++	return found;
++}
+diff --git a/criu/files-chr.c b/criu/files-chr.c
+new file mode 100644
+index 0000000..2eb023e
+--- /dev/null
++++ b/criu/files-chr.c
+@@ -0,0 +1,104 @@
++#include <sys/ioctl.h>
++
++#include "imgset.h"
++#include "pstree.h"
++#include "files-chr.h"
++#include "log.h"
++
++#include "protobuf.h"
++
++/* Checks if file descriptor @lfd is infinibandevent */
++int is_infiniband_link(char *link)
++{
++	return is_anon_link_type(link, "[infinibandevent]");
++}
++
++static int chrfile_open(struct file_desc *d, int *new_fd)
++{
++	int fd, mntns_root;
++	int ret = 0;
++	struct chrfile_info *ci;
++
++	ci = container_of(d, struct chrfile_info, d);
++
++	if (ci->cfe->repair)
++		ci->cfe->flags |= O_REPAIR;
++
++	mntns_root = open_pid_proc(getpid());
++	fd = openat(mntns_root, ci->path, ci->cfe->flags);
++	if (fd < 0){
++		pr_err("open chr file failed\n");
++		return -1;
++	}
++
++	if (ci->cfe->repair) {
++		ret = ioctl(fd, IOCTL_CMD_REPAIR , ci->cfe->index);
++		pr_info("repair ioctl return: %d, index: %d\n", ret, ci->cfe->index);
++		if (ret)
++			goto err;
++	}
++
++	*new_fd = fd;
++	return ret;
++err:
++	close(fd);
++	return ret;
++}
++
++static struct file_desc_ops chrfile_desc_ops = {
++	.type = FD_TYPES__CHR,
++	.open = chrfile_open,
++};
++
++static int collect_one_chrfile(void *o, ProtobufCMessage *base, struct cr_img *i)
++{
++	struct chrfile_info *ci = o;
++	static char dot[] = ".";
++
++	ci->cfe = pb_msg(base, ChrfileEntry);
++	if (ci->cfe->name[1] == '\0')
++		ci->path = dot;
++	else
++		ci->path = ci->cfe->name;
++
++	pr_info("Collected chr file: %#x, name: %s\n", ci->cfe->id, ci->path);
++	file_desc_add(&ci->d, ci->cfe->id, &chrfile_desc_ops);
++
++	return 0;
++}
++
++struct collect_image_info chrfile_cinfo = {
++	.fd_type = CR_FD_CHRFILE,
++	.pb_type = PB_CHRFILE,
++	.priv_size = sizeof(struct chrfile_info),
++	.collect = collect_one_chrfile,
++};
++
++int collect_chr_map(struct pstree_item *me, struct vma_area *vma)
++{
++	struct list_head *list = &rsti(me)->fds;
++	struct fdinfo_list_entry *fle, *tmp;
++	struct chrfile_info *ci;
++	bool exist_fd;
++
++
++	list_for_each_entry_safe(fle, tmp, list, ps_list) {
++		struct file_desc *d = fle->desc;
++
++		if (d->ops->type != FD_TYPES__CHR)
++			continue;
++
++		ci = container_of(d, struct chrfile_info, d);
++		if (!strcmp(vma->e->name, ci->path)) {
++			vma->vmfd = d;
++			vma->e->fd = fle->fe->fd;
++			exist_fd = true;
++			break;
++		}
++	}
++
++	if (!exist_fd)
++		return -EEXIST;
++
++	return 0;
++}
+diff --git a/criu/files-reg.c b/criu/files-reg.c
+index fbdf811..b9576a4 100644
+--- a/criu/files-reg.c
++++ b/criu/files-reg.c
+@@ -45,6 +45,7 @@
+ #include "fault-injection.h"
+ #include "external.h"
+ #include "memfd.h"
++#include "files-chr.h"
+ 
+ #include "protobuf.h"
+ #include "util.h"
+@@ -1640,7 +1641,8 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
+ 		rfe.has_mnt_id = true;
+ 	}
+ 
+-	pr_info("Dumping path for %d fd via self %d [%s]\n", p->fd, lfd, &link->name[1]);
++	pr_info("Dumping path for %d fd via self %d [%s], id: %d\n",
++		p->fd, lfd, &link->name[1], id);
+ 
+ 	/*
+ 	 * The regular path we can handle should start with slash.
+@@ -2373,7 +2375,7 @@ static int collect_one_regfile(void *o, ProtobufCMessage *base, struct cr_img *i
+ 	rfi->remap = NULL;
+ 	rfi->size_mode_checked = false;
+ 
+-	pr_info("Collected [%s] ID %#x\n", rfi->path, rfi->rfe->id);
++	pr_info("Collected regfile [%s] ID %#x\n", rfi->path, rfi->rfe->id);
+ 	return file_desc_add(&rfi->d, rfi->rfe->id, &reg_desc_ops);
+ }
+ 
+diff --git a/criu/files.c b/criu/files.c
+index f262d80..e1681a1 100644
+--- a/criu/files.c
++++ b/criu/files.c
+@@ -49,6 +49,7 @@
+ #include "kerndat.h"
+ #include "fdstore.h"
+ #include "bpfmap.h"
++#include "files-chr.h"
+ 
+ #include "protobuf.h"
+ #include "util.h"
+@@ -325,10 +326,32 @@ int do_dump_gen_file(struct fd_parms *p, int lfd, const struct fdtype_ops *ops,
+ 	e->fd = p->fd;
+ 	e->flags = p->fd_flags;
+ 
++	pr_info("fdinfoEntry fd: %d\n", e->fd);
+ 	ret = fd_id_generate(p->pid, e, p);
+ 	if (ret == 1) /* new ID generated */
+ 		ret = ops->dump(lfd, e->id, p);
+-	else
++	else if (ops->type == FD_TYPES__CHR) {
++		/*
++		 * Sometimes the app_data subprocess may inherit the fd from
++		 * app_data. Those fds may result the unconditional oops during
++		 * the restoration of app_data. Therefore, prevent the dump in
++		 * those condition.
++		 */
++		struct fd_link _link, *link;
++
++		if (!p->link) {
++			if (fill_fdlink(lfd, p, &_link))
++				return -1;
++			link = &_link;
++		} else
++			link = p->link;
++
++		if (find_devname(link->name)) {
++			pr_err("char dev '%s' fd %d is owned by multi-processes\n",
++			       link->name, e->fd);
++			ret = -1;
++		}
++	} else
+ 		/* Remove locks generated by the fd before going to the next */
+ 		discard_dup_locks_tail(p->pid, e->fd);
+ 
+@@ -466,6 +489,58 @@ static int dump_blkdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
+ 	return err;
+ }
+ 
++static int dump_chr_file(int lfd, u32 id, const struct fd_parms *p)
++{
++	int ret;
++	struct fd_link _link, *link;
++	struct cr_img *img;
++	FileEntry fe = FILE_ENTRY__INIT;
++	ChrfileEntry cfe = CHRFILE_ENTRY__INIT;
++
++	if (!p->link) {
++		if (fill_fdlink(lfd, p, &_link))
++			return -1;
++		link = &_link;
++	} else
++		link = p->link;
++
++	pr_info("Dumping chr-file fd %d with lfd %d with id %d, name: %s\n", p->fd, lfd, id, link->name);
++
++	if (strstr(link->name, "(deleted)") != NULL) {
++		pr_err("char device '%s' is deleted\n", link->name);
++		return -ENXIO;
++	}
++
++	cfe.repair = false;
++	if (find_devname(link->name)) {
++		ret = ioctl(lfd, IOCTL_CMD_NEEDREPAIR, 0);
++		if (ret <= 0) {
++			pr_err("ioctl cmd needrepair failed, errno: %d, %s\n", ret, strerror(errno));
++			return -1;
++		} else {
++			pr_info("char device needrepair cmd return: %d\n", ret);
++			cfe.index = ret;
++			cfe.repair = true;
++		}
++	}
++
++	cfe.id = id;
++	cfe.name = &link->name[1];
++	cfe.flags = p->flags;
++	fe.type = FD_TYPES__CHR;
++	fe.id = cfe.id;
++	fe.chr = &cfe;
++
++	img = img_from_set(glob_imgset, CR_FD_FILES);
++	ret = pb_write_one(img, &fe, PB_FILE);
++	return ret;
++}
++
++const struct fdtype_ops chr_dump_ops = {
++	.type = FD_TYPES__CHR,
++	.dump = dump_chr_file,
++};
++
+ static int dump_chrdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
+ {
+ 	struct fd_link *link_old = p->link;
+@@ -493,6 +568,10 @@ static int dump_chrdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
+ 			ops = &tty_dump_ops;
+ 			break;
+ 		}
++		if (opts.dump_char_dev) {
++			ops = &chr_dump_ops;
++			break;
++		}
+ 
+ 		sprintf(more, "%d:%d", maj, minor(p->stat.st_rdev));
+ 		err = dump_unsupp_fd(p, lfd, "chr", more, e);
+@@ -559,6 +638,8 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
+ 			ops = &signalfd_dump_ops;
+ 		else if (is_timerfd_link(link))
+ 			ops = &timerfd_dump_ops;
++		else if (is_infiniband_link(link))
++			return 1;
+ #ifdef CONFIG_HAS_LIBBPF
+ 		else if (is_bpfmap_link(link))
+ 			ops = &bpfmap_dump_ops;
+@@ -663,6 +744,11 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
+ 			ret = dump_one_file(item->pid, dfds->fds[i + off], lfds[i], opts + i, ctl, &e, dfds);
+ 			if (ret)
+ 				break;
++			/* infiniband link file */
++			if (ret > 0) {
++				ret = 0;
++				continue;
++			}
+ 
+ 			ret = pb_write_one(img, &e, PB_FDINFO);
+ 			if (ret)
+@@ -917,6 +1003,7 @@ int prepare_fd_pid(struct pstree_item *item)
+ 	if (!img)
+ 		return -1;
+ 
++	pr_info("prepare_fd_pid\n");
+ 	while (1) {
+ 		FdinfoEntry *e;
+ 
+@@ -1125,6 +1212,7 @@ int setup_and_serve_out(struct fdinfo_list_entry *fle, int new_fd)
+ 	if (reopen_fd_as(fle->fe->fd, new_fd))
+ 		return -1;
+ 
++	pr_info("*******flags: %d",fle->fe->flags);
+ 	if (fcntl(fle->fe->fd, F_SETFD, fle->fe->flags) == -1) {
+ 		pr_perror("Unable to set file descriptor flags");
+ 		return -1;
+@@ -1761,6 +1849,9 @@ static int collect_one_file(void *o, ProtobufCMessage *base, struct cr_img *i)
+ 		ret = collect_one_file_entry(fe, fe->bpf->id, &fe->bpf->base, &bpfmap_cinfo);
+ 		break;
+ #endif
++	case FD_TYPES__CHR:
++		ret = collect_one_file_entry(fe, fe->chr->id, &fe->chr->base, &chrfile_cinfo);
++		break;
+ 	}
+ 
+ 	return ret;
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index 039edba..226acb2 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -193,6 +193,7 @@ struct cr_options {
+ 	int pin_memory;
+ 	int use_fork_pid;
+ 	int with_notifier_kup;
++	int dump_char_dev;
+ };
+ 
+ extern struct cr_options opts;
+diff --git a/criu/include/files-chr.h b/criu/include/files-chr.h
+new file mode 100644
+index 0000000..5be11f5
+--- /dev/null
++++ b/criu/include/files-chr.h
+@@ -0,0 +1,25 @@
++#ifndef __CRIU_FILES_CHR_H__
++#define __CRIU_FILES_CHR_H__
++
++#include "files.h"
++
++#include "images/chr.pb-c.h"
++
++struct chrfile_info {
++	struct file_desc d;
++	ChrfileEntry *cfe;
++	char *path;
++};
++
++extern struct collect_image_info chrfile_cinfo;
++
++extern const struct fdtype_ops chr_dump_ops;
++extern int collect_chr_map(struct pstree_item *me, struct vma_area *);
++
++int parse_devname(void);
++bool find_devname(const char *name);
++
++int collect_chr_map(struct pstree_item *me, struct vma_area *vma);
++int is_infiniband_link(char *link);
++
++#endif /* __CRIU_FILES_CHR_H__ */
+diff --git a/criu/include/files.h b/criu/include/files.h
+index 96face7..1d979a9 100644
+--- a/criu/include/files.h
++++ b/criu/include/files.h
+@@ -15,6 +15,12 @@
+ #include "images/fown.pb-c.h"
+ #include "images/vma.pb-c.h"
+ 
++#ifndef IOCTL_CMD_NEEDREPAIR
++#define IOCTL_CMD_NEEDREPAIR 0x00100000UL
++#define IOCTL_CMD_REPAIR 0x00200000UL
++#define O_REPAIR        040000000
++#endif
++
+ struct parasite_drain_fd;
+ struct pstree_item;
+ struct file_desc;
+diff --git a/criu/include/image-desc.h b/criu/include/image-desc.h
+index 5045bae..e35f8b2 100644
+--- a/criu/include/image-desc.h
++++ b/criu/include/image-desc.h
+@@ -115,6 +115,7 @@ enum {
+ 	CR_FD_MEMFD_FILE,
+ 
+ 	CR_FD_AUTOFS,
++	CR_FD_CHRFILE,
+ 
+ 	CR_FD_MAX
+ };
+diff --git a/criu/include/image.h b/criu/include/image.h
+index f598de7..66492c0 100644
+--- a/criu/include/image.h
++++ b/criu/include/image.h
+@@ -85,6 +85,7 @@
+ #define VMA_AREA_AIORING (1 << 13)
+ #define VMA_AREA_MEMFD	 (1 << 14)
+ #define VMA_AREA_ANON_INODE (1 << 15)
++#define VMA_AREA_CHR     (1 << 16)
+ 
+ #define VMA_CLOSE	  (1 << 28)
+ #define VMA_NO_PROT_WRITE (1 << 29)
+diff --git a/criu/include/protobuf-desc.h b/criu/include/protobuf-desc.h
+index 3824de1..2468e8f 100644
+--- a/criu/include/protobuf-desc.h
++++ b/criu/include/protobuf-desc.h
+@@ -70,6 +70,7 @@ enum {
+ 	PB_BPFMAP_FILE,
+ 	PB_BPFMAP_DATA,
+ 	PB_APPARMOR,
++	PB_CHRFILE,
+ 
+ 	/* PB_AUTOGEN_STOP */
+ 
+diff --git a/criu/mem.c b/criu/mem.c
+index 00965f0..b955d66 100644
+--- a/criu/mem.c
++++ b/criu/mem.c
+@@ -32,6 +32,7 @@
+ #include "compel/infect-util.h"
+ #include "pidfd-store.h"
+ #include "pin-mem.h"
++#include "files-chr.h"
+ 
+ #include "protobuf.h"
+ #include "images/pagemap.pb-c.h"
+@@ -717,7 +718,9 @@ int prepare_mm_pid(struct pstree_item *i)
+ 
+ 		pr_info("vma 0x%" PRIx64 " 0x%" PRIx64 "\n", vma->e->start, vma->e->end);
+ 
+-		if (vma_area_is(vma, VMA_ANON_SHARED))
++		if (vma_area_is(vma, VMA_AREA_CHR))
++			ret = collect_chr_map(i, vma);
++		else if (vma_area_is(vma, VMA_ANON_SHARED))
+ 			ret = collect_shmem(pid, vma);
+ 		else if (vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED))
+ 			ret = collect_filemap(vma);
+@@ -1358,7 +1361,7 @@ int open_vmas(struct pstree_item *t)
+ 	filemap_ctx_init(false);
+ 
+ 	list_for_each_entry(vma, &vmas->h, list) {
+-		if (vma_area_is(vma, VMA_AREA_ANON_INODE))
++		if (vma_area_is(vma, VMA_AREA_ANON_INODE) || vma_area_is(vma, VMA_AREA_CHR))
+ 			continue;
+ 
+ 		if (!vma_area_is(vma, VMA_AREA_REGULAR) || !vma->vm_open)
+diff --git a/criu/proc_parse.c b/criu/proc_parse.c
+index e41d43a..8913d93 100644
+--- a/criu/proc_parse.c
++++ b/criu/proc_parse.c
+@@ -603,11 +603,30 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
+ 	} else if (*vm_file_fd >= 0) {
+ 		struct stat *st_buf = vma_area->vmst;
+ 
++		pr_info("file mode is: %x, st_ino: %ld\n",
++				st_buf->st_mode, st_buf->st_ino);
+ 		if (S_ISREG(st_buf->st_mode))
+ 			/* regular file mapping -- supported */;
+ 		else if (S_ISCHR(st_buf->st_mode) && (st_buf->st_rdev == DEVZERO))
+ 			/* devzero mapping -- also makes sense */;
+-		else {
++		else if (S_ISCHR(st_buf->st_mode) && opts.dump_char_dev) {
++			/* NOTICE: if `--dump-char-dev` option is set, permmit
++			 * all char device memory area dumping.
++			 */
++			 if (strstr(file_path, "uverbs") != NULL) {
++				int len = strlen(file_path) + 1;
++
++				vma_area->e->status |= VMA_AREA_CHR;
++				vma_area->e->name = xmalloc(len);
++				if (!vma_area->e->name) {
++					pr_err("alloc vma area name failed\n");
++					goto err;
++					strncpy(vma_area->e->name, file_path, len);
++					pr_info("vma name content is: %s\n",
++							vma_area->e->name);
++				}
++			 }
++		} else {
+ 			pr_err("Can't handle non-regular mapping on %d's map %" PRIx64 "\n", pid, vma_area->e->start);
+ 			goto err;
+ 		}
+diff --git a/images/Makefile b/images/Makefile
+index 004e22e..37dff9a 100644
+--- a/images/Makefile
++++ b/images/Makefile
+@@ -72,6 +72,7 @@ proto-obj-y	+= bpfmap-file.o
+ proto-obj-y	+= bpfmap-data.o
+ proto-obj-y	+= apparmor.o
+ proto-obj-y	+= rseq.o
++proto-obj-y += chr.o
+ 
+ CFLAGS		+= -iquote $(obj)/
+ 
+diff --git a/images/chr.proto b/images/chr.proto
+new file mode 100644
+index 0000000..67929db
+--- /dev/null
++++ b/images/chr.proto
+@@ -0,0 +1,12 @@
++syntax = "proto2";
++
++import "opts.proto";
++
++message chrfile_entry {
++	required uint32		id	= 1;
++	required uint32		flags	= 2 [(criu).flags = "rfile.flags"];
++	required uint32		index	= 3;
++	required string		name	= 4;
++	required bool		repair	= 5;
++};
++
+diff --git a/images/fdinfo.proto b/images/fdinfo.proto
+index 88f1c11..6549472 100644
+--- a/images/fdinfo.proto
++++ b/images/fdinfo.proto
+@@ -20,6 +20,7 @@ import "pipe.proto";
+ import "tty.proto";
+ import "memfd.proto";
+ import "bpfmap-file.proto";
++import "chr.proto";
+ 
+ enum fd_types {
+ 	UND		= 0;
+@@ -42,6 +43,7 @@ enum fd_types {
+ 	TIMERFD		= 17;
+ 	MEMFD		= 18;
+ 	BPFMAP		= 19;
++	CHR		= 21;
+ 
+ 	/* Any number above the real used. Not stored to image */
+ 	CTL_TTY		= 65534;
+@@ -78,4 +80,5 @@ message file_entry {
+ 	optional tty_file_entry		tty	= 19;
+ 	optional memfd_file_entry	memfd	= 20;
+ 	optional bpfmap_file_entry	bpf	= 21;
++	optional chrfile_entry          chr     = 23;
+ }
+-- 
+2.34.1
+

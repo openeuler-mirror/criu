@@ -1,0 +1,114 @@
+From 4a3b351a69083567392a70bfb8d91c3f666e0aff Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Wed, 19 May 2021 22:49:57 +0800
+Subject: [PATCH 57/72] build: add secure compilation options
+
+Add secure compilation options:
+-fstack-protector -fstack-protector-all
+-Wl,-z,relro,-z,now,-z,noexecstack
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/21
+Signed-off-by: Fu Lin <fulin10@huawei.com>
+---
+ Makefile                     | 4 ++++
+ criu/Makefile                | 2 +-
+ criu/pie/Makefile            | 1 +
+ criu/pie/Makefile.library    | 2 ++
+ lib/Makefile                 | 1 +
+ lib/c/Makefile               | 2 +-
+ scripts/nmk/scripts/build.mk | 5 +++--
+ 7 files changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 08761ef..c1eafdd 100644
+--- a/Makefile
++++ b/Makefile
+@@ -80,6 +80,10 @@ ifeq ($(ARCH),mips)
+         DEFINES		:= -DCONFIG_MIPS
+ endif
+ 
++# secure compilation options
++CFLAGS	+= -fstack-protector-all -fPIE
++LDFLAGS	+= -pie
++
+ #
+ # CFLAGS_PIE:
+ #
+diff --git a/criu/Makefile b/criu/Makefile
+index db4e9d8..3b4d69f 100644
+--- a/criu/Makefile
++++ b/criu/Makefile
+@@ -85,7 +85,7 @@ $(obj)/%: pie
+ 
+ $(obj)/criu: $(PROGRAM-BUILTINS)
+ 	$(call msg-link, $@)
+-	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) $(WRAPFLAGS) $(LDFLAGS) $(GMONLDOPT) -rdynamic -o $@
++	$(Q) $(CC) $(CFLAGS) $^ $(LIBS) $(WRAPFLAGS) $(LDFLAGS) $(GMONLDOPT) -rdynamic -o $@ -Wl,-z,relro,-z,now,-z,noexecstack -fPIE -pie
+ 
+ UNIT-BUILTINS		+= $(obj)/config.o
+ UNIT-BUILTINS		+= $(obj)/log.o
+diff --git a/criu/pie/Makefile b/criu/pie/Makefile
+index 265dcf8..40b5804 100644
+--- a/criu/pie/Makefile
++++ b/criu/pie/Makefile
+@@ -6,6 +6,7 @@ target		:= parasite restorer
+ 
+ CFLAGS		:= $(filter-out -pg $(CFLAGS-GCOV) $(CFLAGS-ASAN),$(CFLAGS))
+ CFLAGS		+= $(CFLAGS_PIE)
++CFLAGS		:= $(filter-out -fstack-protector -fstack-protector-all,$(CFLAGS))
+ ccflags-y	+= -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
+ ccflags-y	+= -Wp,-U_FORTIFY_SOURCE -Wp,-D_FORTIFY_SOURCE=0
+ 
+diff --git a/criu/pie/Makefile.library b/criu/pie/Makefile.library
+index da2a2fa..c022d06 100644
+--- a/criu/pie/Makefile.library
++++ b/criu/pie/Makefile.library
+@@ -27,3 +27,5 @@ CFLAGS		+= $(CFLAGS_PIE)
+ ifeq ($(ARCH),mips)
+ CFLAGS			+= -fno-stack-protector -DCR_NOGLIBC -mno-abicalls -fno-pic
+ endif
++
++CFLAGS		:= $(filter-out -fstack-protector -fstack-protector-all,$(CFLAGS))
+diff --git a/lib/Makefile b/lib/Makefile
+index 575a7ba..729c298 100644
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -14,6 +14,7 @@ lib/c/Makefile: ;
+ lib/c/%: .FORCE
+ 	$(Q) $(MAKE) $(build)=lib/c $@
+ 
++CFLAGS			:= $(filter-out -fPIE,$(CFLAGS))
+ cflags-so		+= $(CFLAGS) -rdynamic -Wl,-soname,$(CRIU_SO).$(CRIU_SO_VERSION_MAJOR)
+ ldflags-so		+= -lprotobuf-c
+ 
+diff --git a/lib/c/Makefile b/lib/c/Makefile
+index af01467..d7f6491 100644
+--- a/lib/c/Makefile
++++ b/lib/c/Makefile
+@@ -4,5 +4,5 @@ obj-y			+= ./images/rpc.pb-c.o
+ ccflags-y		+= -iquote criu/$(ARCH_DIR)/include
+ ccflags-y		+= -iquote criu/include
+ ccflags-y		+= -iquote images
+-ccflags-y		+= -fPIC -fno-stack-protector
++ccflags-y		+= -fPIC
+ ldflags-y		+= -r -z noexecstack
+diff --git a/scripts/nmk/scripts/build.mk b/scripts/nmk/scripts/build.mk
+index d01d2b7..6f366d7 100644
+--- a/scripts/nmk/scripts/build.mk
++++ b/scripts/nmk/scripts/build.mk
+@@ -15,8 +15,9 @@ lib-name	:=
+ lib-target	:=
+ hostprogs-y	:=
+ libso-y		:=
+-ld_flags	:=
+-ldflags-so	:=
++ld_flags	:= -Wl,-z,relro,-z,now,-z,noexecstack
++ldflags-so	:= -Wl,-z,relro,-z,now,-z,noexecstack
++ldflags-y	:= -z relro -z now -z noexecstack
+ arflags-y	:=
+ target          :=
+ deps-y		:=
+-- 
+2.34.1
+

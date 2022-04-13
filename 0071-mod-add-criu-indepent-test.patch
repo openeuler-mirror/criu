@@ -1,0 +1,512 @@
+From 03d188c492efe079a520319ca48e40843367ddcf Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Fri, 18 Feb 2022 16:22:00 +0800
+Subject: [PATCH 71/72] mod: add criu-indepent test
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ test/modules/Makefile         |  21 ++++++
+ test/modules/idr.c            |  79 +++++++++++++++++++++
+ test/modules/jump_table.c     | 107 ++++++++++++++++++++++++++++
+ test/modules/var_kern.c       |  72 +++++++++++++++++++
+ test/modules/var_user.py      |  40 +++++++++++
+ test/modules/workqueue_kern.c | 130 ++++++++++++++++++++++++++++++++++
+ 6 files changed, 449 insertions(+)
+ create mode 100644 test/modules/Makefile
+ create mode 100644 test/modules/idr.c
+ create mode 100644 test/modules/jump_table.c
+ create mode 100644 test/modules/var_kern.c
+ create mode 100644 test/modules/var_user.py
+ create mode 100644 test/modules/workqueue_kern.c
+
+diff --git a/test/modules/Makefile b/test/modules/Makefile
+new file mode 100644
+index 0000000..9458aa7
+--- /dev/null
++++ b/test/modules/Makefile
+@@ -0,0 +1,21 @@
++obj-m	:= var_kern.o workqueue_kern.o jump_table.o idr.o
++
++KDIR	:= /lib/modules/`uname -r`/build
++
++all:
++	make -C $(KDIR) M=$(PWD) modules
++
++clean:
++	make -C $(KDIR) M=$(PWD) clean
++
++var_kern.ko:
++	make -C $(KDIR) M=$(PWD) var_kern.ko
++
++workqueue_kern.ko:
++	make -C $(KDIR) M=$(PWD) workqueue_kern.ko
++
++jump_table.ko:
++	make -C $(KDIR) M=$(PWD) jump_table.ko
++
++idr.ko:
++	make -C $(KDIR) M=$(PWD) idr.ko
+diff --git a/test/modules/idr.c b/test/modules/idr.c
+new file mode 100644
+index 0000000..67f248e
+--- /dev/null
++++ b/test/modules/idr.c
+@@ -0,0 +1,79 @@
++#define pr_fmt(fmt)     KBUILD_MODNAME  ": " fmt
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/idr.h>
++#include <linux/modrestore.h>
++
++DEFINE_IDR(idr_head);
++const int placeholder = 0;
++static int idr_uid = 0;
++
++static int idr_test_show_internal(int id, void *p, void *data)
++{
++        pr_info("id: %d p %pK\n", id, p);
++        sprintf(data+strlen(data), "%d\n", id);
++        return 0;
++}
++
++static ssize_t idr_test_show(struct kobject *kobj,
++                                        struct kobj_attribute *attr,
++                                        char *buf)
++{
++        idr_for_each(&idr_head, idr_test_show_internal, buf);
++        return strlen(buf);
++}
++
++static ssize_t idr_test_store(struct kobject *kobj,
++                                struct kobj_attribute *attr,
++                                const char *buf, size_t count)
++{
++        const unsigned long max = 65536;
++        unsigned id = 0;
++        int retval;
++
++        if (sscanf(buf, "%u", &id) != 1) {
++                pr_err("sscanf empty\n");
++                return -EINVAL;
++        }
++
++        retval = idr_alloc_u32(&idr_head, (void *)&placeholder, &id, max, GFP_KERNEL);
++        pr_info("alloc idr id %u, errno %d\n", id, retval);
++        return retval < 0 ? retval : count;
++}
++
++static struct kobj_attribute idr_test = __ATTR_RW(idr_test);
++
++static int __init mod_init(void)
++{
++        return sysfs_create_file(kernel_kobj, &idr_test.attr);
++}
++
++static void __exit mod_exit(void)
++{
++        sysfs_remove_file(kernel_kobj, &idr_test.attr);
++        idr_destroy(&idr_head);
++        return;
++}
++
++static int __init mod_resume(void)
++{
++        int retval = mures_restore_idr(idr_uid, &idr_head);
++
++        if (retval == 0)
++                retval = sysfs_create_file(kernel_kobj, &idr_test.attr);
++        return retval;
++}
++
++static int __exit mod_suspend(void)
++{
++        sysfs_remove_file(kernel_kobj, &idr_test.attr);
++        return mures_save_idr(idr_uid, &idr_head);
++}
++
++module_init(mod_init);
++module_exit(mod_exit);
++module_resume(mod_resume);
++module_suspend(mod_suspend);
++
++MODULE_LICENSE("GPL");
+\ No newline at end of file
+diff --git a/test/modules/jump_table.c b/test/modules/jump_table.c
+new file mode 100644
+index 0000000..8648c2a
+--- /dev/null
++++ b/test/modules/jump_table.c
+@@ -0,0 +1,107 @@
++#define pr_fmt(fmt)     KBUILD_MODNAME  ": " fmt
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/hashtable.h>
++#include <linux/sysfs.h>
++#include <linux/modrestore.h>
++
++struct func_node {
++        struct hlist_node hash;
++        unsigned long key;
++        unsigned long value;
++}; 
++
++static int status __attribute__((section(".resume_0")));
++
++/* 
++ * The `mures_vcall()` can't used in irq context because of the implementation.
++ * Therefore, we must generate cache.
++ */
++DEFINE_HASHTABLE(__ro_after_init cache, 2);
++
++static int foo(void)
++{
++        status += 1;
++        return status;
++}
++
++static void *find_func(unsigned long addr);
++
++static ssize_t jp_test_show(struct kobject *kobj,
++                                        struct kobj_attribute *attr,
++                                        char *buf)
++{
++        int (*func)(void) = find_func((unsigned long)foo);
++        ssize_t count = 0;
++
++        if (func == NULL) {
++                count = sprintf(buf, "Not Found\n");
++        } else {
++                count = sprintf(buf, "%d", func());
++        }
++
++        return count;
++}
++
++static struct kobj_attribute jp_test = __ATTR_RO(jp_test);
++
++struct func_node nodes[] __ro_after_init = {
++        { .key = (unsigned long)foo, },
++};
++
++static void *find_func(unsigned long addr)
++{
++        struct func_node *obj;
++        int i;
++
++        pr_info("finding addr: %lx\n", addr);
++        hash_for_each(cache, i, obj, hash) {\
++                pr_info("found key: %lx, val: %lx\n", obj->key, obj->value);
++                if (obj->key == addr)
++                        return (void *)obj->value;
++        }
++
++        return NULL;
++}
++
++static void __init build_cache(void)
++{
++        int i;
++
++        for (i = 0; i < ARRAY_SIZE(nodes); i++) {
++                nodes[i].value = mures_vcall(nodes[i].key);
++                hash_add(cache, &nodes[i].hash, nodes[i].key);
++        }
++}
++
++static int __init mod_init(void)
++{
++        build_cache();
++        return sysfs_create_file(kernel_kobj, &jp_test.attr);
++}
++
++static void __exit mod_exit(void)
++{
++        sysfs_remove_file(kernel_kobj, &jp_test.attr);
++        return;
++}
++
++static int __init mod_resume(void)
++{
++        build_cache();
++        return sysfs_create_file(kernel_kobj, &jp_test.attr);
++}
++
++static int __exit mod_suspend(void)
++{
++        sysfs_remove_file(kernel_kobj, &jp_test.attr);
++        return 0;
++}
++
++module_init(mod_init);
++module_exit(mod_exit);
++module_resume(mod_resume);
++module_suspend(mod_suspend);
++
++MODULE_LICENSE("GPL");
+\ No newline at end of file
+diff --git a/test/modules/var_kern.c b/test/modules/var_kern.c
+new file mode 100644
+index 0000000..4321e3b
+--- /dev/null
++++ b/test/modules/var_kern.c
+@@ -0,0 +1,72 @@
++#define pr_fmt(fmt) KBUILD_MODNAME  ": " fmt
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/sysfs.h>
++
++/*  test variable persistence */
++
++static int mod_int __attribute__((section(".resume_0")));
++static char *mod_str1 __attribute__((section(".resume_1"))) = "init";
++static char *mod_str2 __attribute__((section(".resume_2"))) = "upgrade";
++static char *mod_str __attribute__((section(".resume_3")));
++
++static ssize_t var_test_show(struct kobject  *kobj,
++				struct kobj_attribute *attr,
++				char *buf)
++{
++	ssize_t count = 0;
++
++	count += sprintf(buf, "%d", mod_int);
++	count += sprintf(buf+count, " %s", mod_str);
++
++	return count;
++}
++
++static struct kobj_attribute sysfs_var = __ATTR_RO(var_test);
++
++static __init int mod1_resume(void)
++{
++	mod_int += 1;
++	mod_str = mod_str2;
++
++	pr_info("This is %s, index %d\n", __func__, mod_int);
++
++	return sysfs_create_file(kernel_kobj, &sysfs_var.attr);
++}
++
++static __exit int mod1_suspend(void)
++{
++	mod_int += 1;
++
++	pr_info("This is %s, index %d\n", __func__, mod_int);
++	sysfs_remove_file(kernel_kobj, &sysfs_var.attr);
++
++	return 0;
++}
++
++static __init int mod1_init(void)
++{
++	mod_int = 0;
++	mod_str = mod_str1;
++
++	pr_info("This is %s, index %d\n", __func__, mod_int);
++
++	return sysfs_create_file(kernel_kobj, &sysfs_var.attr);
++}
++
++static __exit void mod1_exit(void)
++{
++	mod_int += 1;
++
++	pr_info("This is %s, index %d\n", __func__, mod_int);
++	sysfs_remove_file(kernel_kobj, &sysfs_var.attr);
++
++	return;
++}
++
++module_resume(mod1_resume);
++module_suspend(mod1_suspend);
++module_init(mod1_init);
++module_exit(mod1_exit);
++MODULE_LICENSE("GPL");
+diff --git a/test/modules/var_user.py b/test/modules/var_user.py
+new file mode 100644
+index 0000000..98c5193
+--- /dev/null
++++ b/test/modules/var_user.py
+@@ -0,0 +1,40 @@
++import unittest
++import subprocess
++
++
++class TestVarMethods(unittest.TestCase):
++    mod_name = "var_kern"
++
++    def unload_mod(self):
++        with open("/proc/modules") as f:
++            for line in f.readlines():
++                words = line.split()
++                if words[0] == self.mod_name:
++                    subprocess.check_call(["rmmod", self.mod_name])
++                    break
++
++    def setUp(self):
++        subprocess.check_call(["make", "var_kern.ko"])
++        self.unload_mod()
++
++    def tearDown(self):
++        mod = f"{self.mod_name}.ko"
++        self.unload_mod()
++
++    def test_var(self):
++        mod = f"{self.mod_name}.ko"
++        subprocess.check_call(["insmod", mod])
++        with open("/sys/kernel/var_test") as f:
++            line = f.readline()
++        self.assertEqual(line, "0 init")
++        subprocess.check_call(["rmmod", "-r", mod])
++        subprocess.check_call(["rmmod", mod])
++        subprocess.check_call(["insmod", "-r", mod])
++        with open("/sys/kernel/var_test") as f:
++            line = f.readline()
++        self.assertEqual(line, "2 upgrade")
++        subprocess.check_call(["rmmod", mod])
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/test/modules/workqueue_kern.c b/test/modules/workqueue_kern.c
+new file mode 100644
+index 0000000..cecfb8c
+--- /dev/null
++++ b/test/modules/workqueue_kern.c
+@@ -0,0 +1,130 @@
++#define pr_fmt(fmt)     KBUILD_MODNAME  ": " fmt
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/sysfs.h>
++#include <linux/delay.h>
++#include <linux/modrestore.h>
++
++struct mod_status {
++        struct workqueue_struct *wq;
++};
++
++static struct workqueue_struct *wq;
++static int wq_status  __attribute__((section(".resume_0")));
++
++static void worker_func(struct work_struct *work)
++{
++        wq_status += 1;
++        pr_info("worker run...\n");
++        mdelay(100);
++        pr_info("worker end.\n");
++        kfree(work);
++}
++
++static ssize_t wq_test_show(struct kobject *kobj,
++                                        struct kobj_attribute *attr,
++                                        char *buf)
++{
++        flush_workqueue(wq);
++        return sprintf(buf, "%pK %d", wq, wq_status);
++}
++
++static struct kobj_attribute wq_test = __ATTR_RO(wq_test);
++
++static int __init mod_init(void)
++{
++        int retval;
++
++        retval = sysfs_create_file(kernel_kobj, &wq_test.attr);
++        if (retval != 0) {
++                pr_err("sysfs_create_file failed.\n");
++                return retval;
++        }
++
++        wq = alloc_workqueue("workqueue_kern_test",  WQ_UNBOUND, 0);
++        if (wq == NULL) {
++                pr_err("unable to allocate workqueue\n");
++                sysfs_remove_file(kernel_kobj, &wq_test.attr);
++                retval = -ENOMEM;
++                goto out;
++        }
++
++        retval = 0;
++out:
++        return retval;
++}
++
++static void __exit mod_exit(void)
++{
++        destroy_workqueue(wq);
++        sysfs_remove_file(kernel_kobj, &wq_test.attr);
++}
++
++static int __init mod_resume(void)
++{
++        struct mod_status *data;
++        int retval;
++
++        data = get_module_state_space(KBUILD_MODNAME, NULL);
++        if (!data) {
++                pr_info("get_module_state_space failure\n");
++                return -ENOMEM;
++        }
++        wq = data->wq;
++
++        retval = sysfs_create_file(kernel_kobj, &wq_test.attr);
++        if (retval != 0) {
++                pr_err("sysfs_create_file failed.\n");
++                return retval;
++        }
++
++        return resume_workqueue(wq);
++}
++
++static int __exit queue_worker(void)
++{
++        struct delayed_work *worker = kzalloc(sizeof(struct work_struct), GFP_KERNEL);
++
++        if (worker == NULL) {
++                pr_err("alloc worker space failed\n");
++                return -ENOMEM;
++        }
++
++        INIT_DELAYED_WORK(worker, worker_func);
++        queue_delayed_work(wq, worker, 100);
++        return 0;
++}
++
++static int __exit mod_suspend(void)
++{
++        struct mod_status *data;
++        int retval;
++
++        data = alloc_module_state_space(KBUILD_MODNAME, sizeof(*data));
++        if (data == NULL) {
++                pr_err("alloc_module_state_space failed\n");
++                return -ENOMEM;
++        }
++
++        data->wq = wq;
++        if (queue_worker() != 0)
++                return -ENOMEM;
++
++        retval = suspend_workqueue(wq);
++        if (retval != 0) {
++                pr_err("suspend workqueue failed\n");
++                return retval;
++        }
++
++        sysfs_remove_file(kernel_kobj, &wq_test.attr);
++        return 0;
++}
++
++module_init(mod_init);
++module_exit(mod_exit);
++module_resume(mod_resume);
++module_suspend(mod_suspend);
++
++MODULE_LICENSE("GPL");
+\ No newline at end of file
+-- 
+2.34.1
+

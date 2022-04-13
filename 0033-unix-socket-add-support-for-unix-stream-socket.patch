@@ -1,0 +1,403 @@
+From fe39f73462e84a1a59d9b2b81a97e26cd1f2d20c Mon Sep 17 00:00:00 2001
+From: Luo Longjun <luolongjun@huawei.com>
+Date: Mon, 7 Jun 2021 11:50:42 +0800
+Subject: [PATCH 33/72] unix socket: add support for unix stream socket
+
+When dump unix stream socket with external connections,
+we will tell kernel to turn repair mode on for this sock.
+And then kernel will keep this sock before restoring it.
+In this process, the other socket which communicates with
+this sock in repair mode will get EAGAIN or blocked.
+
+Signed-off-by: Luo Longjun <luolongjun@huawei.com>
+
+fix unix socket dump and restore err
+Fix name-less unix socket dump and restore problem.
+
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+
+unix socket:ignore repair error from kernel
+leave error for applications to deal with.
+
+Signed-off-by: Luo Longjun <luolongjun@huawei.com>
+
+- enable this feature by check cmdline `unix_stream_restore_enable`
+- don't set repair mode for non-external socket
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/cr-dump.c         |   1 +
+ criu/include/kerndat.h |   1 +
+ criu/include/sockets.h |   1 +
+ criu/kerndat.c         |  33 +++++++++
+ criu/sk-unix.c         | 150 ++++++++++++++++++++++++++++++++++++++---
+ images/sk-unix.proto   |   1 +
+ 6 files changed, 178 insertions(+), 9 deletions(-)
+
+diff --git a/criu/cr-dump.c b/criu/cr-dump.c
+index fd17413..e0e11cc 100644
+--- a/criu/cr-dump.c
++++ b/criu/cr-dump.c
+@@ -2002,6 +2002,7 @@ static int cr_dump_finish(int ret)
+ 
+ 	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
+ 	cgp_fini();
++	unix_stream_unlock(ret);
+ 
+ 	if (!ret) {
+ 		/*
+diff --git a/criu/include/kerndat.h b/criu/include/kerndat.h
+index 05abeda..3979939 100644
+--- a/criu/include/kerndat.h
++++ b/criu/include/kerndat.h
+@@ -76,6 +76,7 @@ struct kerndat_s {
+ 	bool has_nftables_concat;
+ 	bool has_rseq;
+ 	bool has_ptrace_get_rseq_conf;
++	bool has_unix_sk_repair;
+ };
+ 
+ extern struct kerndat_s kdat;
+diff --git a/criu/include/sockets.h b/criu/include/sockets.h
+index 2391b48..e43a760 100644
+--- a/criu/include/sockets.h
++++ b/criu/include/sockets.h
+@@ -43,6 +43,7 @@ extern int add_fake_unix_queuers(void);
+ extern int fix_external_unix_sockets(void);
+ extern int prepare_scms(void);
+ extern int unix_note_scm_rights(int id_for, uint32_t *file_ids, int *fds, int n_ids);
++extern void unix_stream_unlock(int ret);
+ 
+ extern struct collect_image_info netlink_sk_cinfo;
+ 
+diff --git a/criu/kerndat.c b/criu/kerndat.c
+index af7113a..6d6aac1 100644
+--- a/criu/kerndat.c
++++ b/criu/kerndat.c
+@@ -1259,6 +1259,36 @@ static int kerndat_has_nftables_concat(void)
+ #endif
+ }
+ 
++#define UNIX_STREAM_RESTORE_ENABLE_FILE	"/sys/module/kernel/parameters/unix_stream_restore_enable"
++
++static void kerndat_has_unix_sk_repair(void)
++{
++	FILE *fp;
++	char ch = 'N';
++
++	if (access(UNIX_STREAM_RESTORE_ENABLE_FILE, F_OK) < 0) {
++		pr_debug("C/R external unix stream socket is not support\n");
++		return;
++	}
++
++	fp = fopen(UNIX_STREAM_RESTORE_ENABLE_FILE, "r");
++	if (fp == NULL) {
++		pr_err("failed to open '%s': %s\n",
++		       UNIX_STREAM_RESTORE_ENABLE_FILE, strerror(errno));
++		return;
++	}
++
++	fscanf(fp, "%c", &ch);
++	if (ch == 'Y') {
++		pr_debug("enable C/R external unix stream socket support\n");
++		kdat.has_unix_sk_repair = true;
++	}
++
++	fclose(fp);
++
++	return;
++}
++
+ int kerndat_init(void)
+ {
+ 	int ret;
+@@ -1419,6 +1449,9 @@ int kerndat_init(void)
+ 		pr_err("kerndat_has_ptrace_get_rseq_conf failed when initializing kerndat.\n");
+ 		ret = -1;
+ 	}
++
++	kerndat_has_unix_sk_repair();
++
+ 	kerndat_lsm();
+ 	kerndat_mmap_min_addr();
+ 	kerndat_files_stat();
+diff --git a/criu/sk-unix.c b/criu/sk-unix.c
+index f3fe60c..86bfa18 100644
+--- a/criu/sk-unix.c
++++ b/criu/sk-unix.c
+@@ -72,6 +72,7 @@ struct unix_sk_desc {
+ 	char *name;
+ 	unsigned int nr_icons;
+ 	unsigned int *icons;
++	int repair_ino;
+ 
+ 	unsigned int vfs_dev;
+ 	unsigned int vfs_ino;
+@@ -89,9 +90,18 @@ struct unix_sk_desc {
+ 	struct list_head peer_list;
+ 	struct list_head peer_node;
+ 
++	struct list_head repair_list;
++	struct list_head repair_node;
++	struct unix_stream_extern_socket_desc *ext_node;
++
+ 	UnixSkEntry *ue;
+ };
+ 
++struct unix_stream_extern_socket_desc {
++	struct list_head list;
++	int fd;
++};
++
+ /*
+  * The mutex_ghost is accessed from different tasks,
+  * so make sure it is in shared memory.
+@@ -100,6 +110,7 @@ static mutex_t *mutex_ghost;
+ 
+ static LIST_HEAD(unix_sockets);
+ static LIST_HEAD(unix_ghost_addr);
++static LIST_HEAD(unix_stream_external_sockets);
+ 
+ static int unix_resolve_name(int lfd, uint32_t id, struct unix_sk_desc *d, UnixSkEntry *ue, const struct fd_parms *p);
+ 
+@@ -116,6 +127,26 @@ struct unix_sk_listen_icon {
+ 
+ static struct unix_sk_listen_icon *unix_listen_icons[SK_HASH_SIZE];
+ 
++static int unix_stream_repair_on(int fd)
++{
++	int ret, aux = 1;
++	ret = setsockopt(fd, SOL_TCP, TCP_REPAIR_OPTIONS, &aux, sizeof(aux));
++	if (ret < 0)
++		pr_err("Can't turn repair mod for unix stream on. \n");
++
++	return ret;
++}
++
++static int unix_stream_repair_off(int fd)
++{
++	int ret, aux = 0;
++	ret = setsockopt(fd, SOL_TCP, TCP_REPAIR_OPTIONS, &aux, sizeof(aux));
++	if (ret < 0)
++		pr_err("Can't turn repair mod for unix stream off. \n");
++
++	return ret;
++}
++
+ static struct unix_sk_listen_icon *lookup_unix_listen_icons(unsigned int peer_ino)
+ {
+ 	struct unix_sk_listen_icon *ic;
+@@ -331,6 +362,8 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
+ 	FilePermsEntry *perms;
+ 	FownEntry *fown;
+ 	void *m;
++	unsigned int len;
++	int ret;
+ 
+ 	m = xmalloc(sizeof(UnixSkEntry) + sizeof(SkOptsEntry) + sizeof(FilePermsEntry) + sizeof(FownEntry));
+ 	if (!m)
+@@ -372,6 +405,7 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
+ 	ue->fown = fown;
+ 	ue->opts = skopts;
+ 	ue->uflags = 0;
++	ue->repair_ino = 0;
+ 
+ 	if (unix_resolve_name(lfd, id, sk, ue, p))
+ 		goto err;
+@@ -419,6 +453,41 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
+ 			goto err;
+ 		}
+ 
++		/*
++		 * Don't handle non-external unix socket, criu will restore it.
++		 *
++		 * use `sk->name != NULL || peer->name != NULL` to prevent
++		 * `socketpair()` sk condition.
++		 */
++		if (kdat.has_unix_sk_repair && !sk->sd.already_dumped
++				&& (sk->name != NULL || peer->name != NULL)
++				&& ue->type == SOCK_STREAM) {
++			struct unix_stream_extern_socket_desc *d;
++
++			d = xzalloc(sizeof(*d));
++			if (!d)
++				goto err;
++
++			/* Attention: used for upgrade in the same machine
++			 * May in conflict with original usage
++			 */
++			pr_info("set %d(fd %d) unix stream repair on \n", sk->sd.ino, lfd);
++			ret = unix_stream_repair_on(lfd);
++			if (ret < 0)
++				goto err;
++
++			d->fd = dup(lfd);
++			pr_info("add %d into unix_stream_external_sockets\n", sk->sd.ino);
++			list_add_tail(&d->list, &unix_stream_external_sockets);
++			list_add(&sk->repair_node, &peer->repair_list);
++			sk->ext_node = d;
++
++			len = sizeof(ue->repair_ino);
++			ret = getsockopt(lfd, SOL_TCP, TCP_REPAIR_OPTIONS, &ue->repair_ino, &len);
++			if (ret < 0)
++				goto err;
++		}
++
+ 		/*
+ 		 * Peer should have us as peer or have a name by which
+ 		 * we can access one.
+@@ -520,6 +589,26 @@ dump:
+ 
+ 	sk->sd.already_dumped = 1;
+ 
++	while (!list_empty(&sk->repair_list)) {
++		struct unix_sk_desc *psk;
++		struct unix_stream_extern_socket_desc *d;
++
++		psk = list_first_entry(&sk->repair_list, struct unix_sk_desc, repair_node);
++		list_del_init(&psk->repair_node);
++
++		pr_info("delete ino %d into unix_stream_external_sockets\n", psk->sd.ino);
++
++		d = psk->ext_node;
++		list_del_init(&d->list);
++		psk->ext_node = NULL;
++		/* ino start from 1, using 0 to tag the non-repairing socket is safe. */
++		psk->ue->repair_ino = 0;
++
++		unix_stream_repair_off(d->fd);
++		close_safe(&d->fd);
++		xfree(d);
++	}
++
+ 	while (!list_empty(&sk->peer_list)) {
+ 		struct unix_sk_desc *psk;
+ 		psk = list_first_entry(&sk->peer_list, struct unix_sk_desc, peer_node);
+@@ -754,6 +843,8 @@ static int unix_collect_one(const struct unix_diag_msg *m, struct nlattr **tb, s
+ 
+ 	INIT_LIST_HEAD(&d->peer_list);
+ 	INIT_LIST_HEAD(&d->peer_node);
++	INIT_LIST_HEAD(&d->repair_list);
++	INIT_LIST_HEAD(&d->repair_node);
+ 	d->fd = -1;
+ 
+ 	if (tb[UNIX_DIAG_SHUTDOWN])
+@@ -866,16 +957,18 @@ static int __dump_external_socket(struct unix_sk_desc *sk, struct unix_sk_desc *
+ 		return -1;
+ 	}
+ 
+-	if (peer->type != SOCK_DGRAM) {
+-		show_one_unix("Ext stream not supported", peer);
+-		pr_err("Can't dump half of stream unix connection.\n");
++	if (peer->type != SOCK_DGRAM &&
++		peer->type != SOCK_STREAM) {
++		show_one_unix("Ext unix type not supported", peer);
++		pr_err("Can't dump this kind of unix connection.\n");
+ 		return -1;
+ 	}
+ 
+-	if (!peer->name) {
++	/* part 1: prevent NULL pointer oops */
++	if (!peer->name && !sk->name) {
+ 		show_one_unix("Ext dgram w/o name", peer);
++		show_one_unix("Ext dgram w/o name", sk);
+ 		pr_err("Can't dump name-less external socket.\n");
+-		pr_err("%d\n", sk->fd);
+ 		return -1;
+ 	}
+ 
+@@ -921,7 +1014,7 @@ int fix_external_unix_sockets(void)
+ 
+ 		fd_id_generate_special(NULL, &e.id);
+ 		e.ino = sk->sd.ino;
+-		e.type = SOCK_DGRAM;
++		e.type = sk->type;
+ 		e.state = TCP_LISTEN;
+ 		e.name.data = (void *)sk->name;
+ 		e.name.len = (size_t)sk->namelen;
+@@ -948,6 +1041,20 @@ err:
+ 	return -1;
+ }
+ 
++void unix_stream_unlock(int ret)
++{
++	struct unix_stream_extern_socket_desc *d;
++	pr_debug("Unlocking unix stream sockets\n");
++
++	list_for_each_entry(d, &unix_stream_external_sockets, list) {
++		if (ret) {
++			pr_debug("unlock fd %d \n", d->fd);
++			unix_stream_repair_off(d->fd);
++		}
++		close_safe(&d->fd);
++	}
++}
++
+ struct unix_sk_info {
+ 	UnixSkEntry *ue;
+ 	struct list_head list;
+@@ -1335,6 +1442,7 @@ static int post_open_standalone(struct file_desc *d, int fd)
+ 	struct unix_sk_info *peer;
+ 	struct sockaddr_un addr;
+ 	int cwd_fd = -1, root_fd = -1, ns_fd = -1;
++	int ret, value;
+ 
+ 	ui = container_of(d, struct unix_sk_info, d);
+ 	BUG_ON((ui->flags & (USK_PAIR_MASTER | USK_PAIR_SLAVE)) || (ui->ue->uflags & (USK_CALLBACK | USK_INHERIT)));
+@@ -1391,7 +1499,28 @@ static int post_open_standalone(struct file_desc *d, int fd)
+ 	 * while we're connecting in sake of ghost sockets.
+ 	 */
+ 	mutex_lock(mutex_ghost);
+-	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr.sun_family) + len) < 0) {
++
++	/* we handle unix stream with external connections here.
++	 *
++	 * use `sk->name != NULL || peer->name != NULL` to prevent
++	 * `socketpair()` sk condition.
++	 */
++	if (kdat.has_unix_sk_repair && peer->name
++			&& (ui->name != NULL || peer->name != NULL)
++			&& ui->ue->type == SOCK_STREAM && ui->ue->repair_ino != 0) {
++		value = ui->ue->repair_ino;
++		ret = setsockopt(fd, SOL_TCP, TCP_REPAIR, &value, sizeof(value));
++		if (ret < 0) {
++		/* permit the unix sk resume successfully when the peer has been
++		 * closed, just warn here */
++			pr_warn("Can't repair %d socket\n", value);
++		}
++
++		ret = unix_stream_repair_off(fd);
++		if (ret < 0) {
++			goto err_revert_and_exit;
++		}
++	} else if (connect(fd, (struct sockaddr *)&addr, sizeof(addr.sun_family) + len) < 0) {
+ 		pr_perror("Can't connect %d socket", ui->ue->ino);
+ 		goto err_revert_and_exit;
+ 	}
+@@ -2068,8 +2197,11 @@ static int init_unix_sk_info(struct unix_sk_info *ui, UnixSkEntry *ue)
+ 		}
+ 
+ 		ui->name = (void *)ue->name.data;
+-	} else
+-		ui->name = NULL;
++	} else {
++		/* part 2: prevent NULL pointer oops */
++		ui->name = "";
++	}
++
+ 	ui->name_dir = (void *)ue->name_dir;
+ 
+ 	ui->flags = 0;
+diff --git a/images/sk-unix.proto b/images/sk-unix.proto
+index 8ddbccd..3f77718 100644
+--- a/images/sk-unix.proto
++++ b/images/sk-unix.proto
+@@ -54,4 +54,5 @@ message unix_sk_entry {
+ 	optional uint32			ns_id		= 16;
+ 	optional sint32			mnt_id		= 17 [default = -1];
+ 	/* Please, don't use field with number 18. */
++	required sint32			repair_ino  = 19;
+ }
+-- 
+2.34.1
+
