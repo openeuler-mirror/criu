@@ -1,0 +1,45 @@
+From 06a0277c2aab1442c724217957fd5f915ace2753 Mon Sep 17 00:00:00 2001
+From: Zhuling <zhuling8@huawei.com>
+Date: Thu, 22 Jul 2021 10:15:15 +0800
+Subject: [PATCH 42/72] reg-file: fix dump fail problem with null seek op
+
+Some customizing `struct file_operations` implementation has
+no `llseek`, therefore ignore the no-implementation errno.
+
+Fix file dumping fail problem when the file seek op is null.
+
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/files-reg.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/criu/files-reg.c b/criu/files-reg.c
+index 1a3b836..6dc8745 100644
+--- a/criu/files-reg.c
++++ b/criu/files-reg.c
+@@ -2176,9 +2176,18 @@ static int do_open_reg(int ns_root_fd, struct reg_file_info *rfi, void *arg)
+ 	 */
+ 	if (!(rfi->rfe->flags & O_PATH)) {
+ 		if (rfi->rfe->pos != -1ULL && lseek(fd, rfi->rfe->pos, SEEK_SET) < 0) {
+-			pr_perror("Can't restore file pos");
+-			close(fd);
+-			return -1;
++			/*
++			 * Some customizing `struct file_operations`
++			 * implementation has no `llseek`, therefore
++			 * ignore the no-implementation errno.
++			 */
++			if (errno == ESPIPE) {
++				pr_warn("No ability to restore file ops\n");
++			} else {
++				pr_perror("Can't restore file pos");
++				close(fd);
++				return -1;
++			}
+ 		}
+ 	}
+ 
+-- 
+2.34.1
+

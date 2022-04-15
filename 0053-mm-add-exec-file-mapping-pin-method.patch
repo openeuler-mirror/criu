@@ -1,0 +1,120 @@
+From 5acbfc773177797d954645e40ba8f7ed94a55d60 Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Tue, 30 Nov 2021 11:38:18 +0800
+Subject: [PATCH 53/72] mm: add exec file mapping pin method
+
+In order to improve criu dump and restore performance,
+enable pin method for exec file mapping.
+
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+---
+ criu/config.c             |  4 ++++
+ criu/crtools.c            |  1 +
+ criu/include/cr_options.h |  1 +
+ criu/mem.c                | 12 +++++++++++-
+ criu/pin-mem.c            |  4 ++++
+ 5 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/criu/config.c b/criu/config.c
+index fdbc5eb..c0358e5 100644
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -710,6 +710,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		{ "share-src-ports", required_argument, 0, 2001 },
+ 		{ "reserve-ports", required_argument, 0, 'P' },
+ 		BOOL_OPT("parallel", &opts.parallel),
++		{ "exec-pin-start", required_argument, 0, 2002 },
+ 		{},
+ 	};
+ 
+@@ -1051,6 +1052,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		case 2001:
+ 			SET_CHAR_OPTS(share_src_ports, optarg);
+ 			break;
++		case 2002:
++			opts.exec_pin_start = atoi(optarg);
++			break;
+ 		case 'V':
+ 			pr_msg("Version: %s\n", CRIU_VERSION);
+ 			if (strcmp(CRIU_GITID, "0"))
+diff --git a/criu/crtools.c b/criu/crtools.c
+index c20b3b7..40e2d51 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -473,6 +473,7 @@ usage:
+ 	       "  --file-locks-repair	Use repair mode to dump and restore file locks\n"
+ 	       "  --reserve-ports	Reserve src ports in kernel\n"
+ 	       "  --parallel		Collect smaps parallel to accellrate dumping speed\n"
++	       "  --exec-pin-start	Exec file map's pin start index\n"
+ 	       "\n"
+ 	       "Check options:\n"
+ 	       "  Without options, \"criu check\" checks availability of absolutely required\n"
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index 6478d4d..a64e977 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -202,6 +202,7 @@ struct cr_options {
+ 	char *share_src_ports;
+ 	int reserve_ports;
+ 	int parallel;
++	int exec_pin_start;
+ };
+ 
+ extern struct cr_options opts;
+diff --git a/criu/mem.c b/criu/mem.c
+index b955d66..ccb6ae6 100644
+--- a/criu/mem.c
++++ b/criu/mem.c
+@@ -448,6 +448,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
+ 	int possible_pid_reuse = 0;
+ 	bool has_parent;
+ 	int parent_predump_mode = -1;
++	int dump_iov;
+ 
+ 	pr_info("\n");
+ 	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, item->pid->real);
+@@ -521,9 +522,18 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
+ 	if (mdc->parent_ie)
+ 		parent_predump_mode = mdc->parent_ie->pre_dump_mode;
+ 
++	dump_iov = 0;
+ 	list_for_each_entry(vma_area, &vma_area_list->h, list) {
+ 		if (opts.pin_memory && should_pin_vmae(vma_area->e)) {
+-			continue;
++			if (opts.exec_pin_start
++			    && vma_entry_is(vma_area->e, VMA_FILE_PRIVATE)
++			    && ((vma_area->e->prot & PROT_WRITE)
++				     || !(vma_area->e->prot & PROT_EXEC))) {
++				dump_iov += 1;
++				if (dump_iov > opts.exec_pin_start + 1)
++					continue;
++			} else
++				continue;
+ 		}
+ 
+ 		if (vma_entry_is(vma_area->e, VMA_AREA_ANON_INODE))
+diff --git a/criu/pin-mem.c b/criu/pin-mem.c
+index 96ca2c5..686217f 100644
+--- a/criu/pin-mem.c
++++ b/criu/pin-mem.c
+@@ -2,6 +2,7 @@
+ #include <stdbool.h>
+ #include <sys/ioctl.h>
+ 
++#include "cr_options.h"
+ #include "pstree.h"
+ #include "mem.h"
+ #include "vma.h"
+@@ -30,6 +31,9 @@ bool should_pin_vmae(VmaEntry *vmae)
+ 	if (vma_entry_is(vmae, VMA_ANON_PRIVATE))
+ 		return true;
+ 
++	if (opts.exec_pin_start && vma_entry_is(vmae, VMA_FILE_PRIVATE))
++		return true;
++
+ 	return false;
+ }
+ 
+-- 
+2.34.1
+

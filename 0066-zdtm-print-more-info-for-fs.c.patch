@@ -1,0 +1,43 @@
+From af97bc76b1dc1e6ca2b924d7e5666dd04a1847b2 Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Wed, 16 Feb 2022 10:39:06 +0800
+Subject: [PATCH 66/72] zdtm: print more info for fs.c
+
+---
+ test/zdtm/lib/fs.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/test/zdtm/lib/fs.c b/test/zdtm/lib/fs.c
+index 7b8be5f..a716b40 100644
+--- a/test/zdtm/lib/fs.c
++++ b/test/zdtm/lib/fs.c
+@@ -4,6 +4,7 @@
+ #include <errno.h>
+ #include <unistd.h>
+ #include <limits.h>
++#include <sys/stat.h>
+ 
+ #include "zdtmtst.h"
+ #include "fs.h"
+@@ -103,11 +104,15 @@ int get_cwd_check_perm(char **result)
+ 	}
+ 
+ 	if (access(cwd, X_OK)) {
+-		pr_err("access check for bit X for current dir path '%s' "
+-		       "failed for uid:%d,gid:%d, error: %d(%s). "
++		struct stat sb;
++
++		stat(cwd, &sb);
++		pr_err("access check for bit X for current dir path '%s'(uid:%d,gid:%d,mode:%o) "
++		       "failed for uid:%d,gid:%d,euid:%d, error: %d(%s). "
+ 		       "Bit 'x' should be set in all path components of "
+ 		       "this directory\n",
+-		       cwd, getuid(), getgid(), errno, strerror(errno));
++		       cwd, sb.st_uid, sb.st_gid, sb.st_mode, getuid(), getgid(),
++		       geteuid(), errno, strerror(errno));
+ 		return -1;
+ 	}
+ 
+-- 
+2.34.1
+

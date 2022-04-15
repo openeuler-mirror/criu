@@ -1,0 +1,316 @@
+From 9bb9af3189ae8a7eadf975befa2aa30b7227259e Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Wed, 19 May 2021 21:52:49 +0800
+Subject: [PATCH 24/72] anon-inode: add support for anon inode fd
+
+Add support for anon inode fd dump and restore during module upgrade.
+
+Signed-off-by: Xiaoguang Li <lixiaoguang2@huawei.com>
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+Signed-off-by: fu.lin <fu.lin10@huawei.com>
+---
+ criu/cr-restore.c       |  3 +++
+ criu/files-reg.c        |  3 ++-
+ criu/include/image.h    |  1 +
+ criu/include/mem.h      |  1 +
+ criu/include/restorer.h |  6 ++++++
+ criu/mem.c              | 23 +++++++++++++++++++++++
+ criu/pie/restorer.c     | 37 +++++++++++++++++++++++++++++++++++++
+ criu/proc_parse.c       | 31 ++++++++++++++++++++++++++++---
+ images/vma.proto        |  1 +
+ 9 files changed, 102 insertions(+), 4 deletions(-)
+
+diff --git a/criu/cr-restore.c b/criu/cr-restore.c
+index 03511b6..b805265 100644
+--- a/criu/cr-restore.c
++++ b/criu/cr-restore.c
+@@ -971,6 +971,8 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
+ 	if (prepare_vmas(current, ta))
+ 		return -1;
+ 
++	if (prepare_vma_names(current, ta))
++		return -1;
+ 	/*
+ 	 * Sockets have to be restored in their network namespaces,
+ 	 * so a task namespace has to be restored after sockets.
+@@ -3733,6 +3735,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
+ #endif
+ 
+ 	RST_MEM_FIXUP_PPTR(task_args->vmas);
++	RST_MEM_FIXUP_PPTR(task_args->vma_names);
+ 	RST_MEM_FIXUP_PPTR(task_args->rings);
+ 	RST_MEM_FIXUP_PPTR(task_args->tcp_socks);
+ 	RST_MEM_FIXUP_PPTR(task_args->timerfd);
+diff --git a/criu/files-reg.c b/criu/files-reg.c
+index ee54d1d..fbdf811 100644
+--- a/criu/files-reg.c
++++ b/criu/files-reg.c
+@@ -2137,7 +2137,7 @@ int do_open_reg_noseek_flags(int ns_root_fd, struct reg_file_info *rfi, void *ar
+ 
+ 	/* unnamed temporary files are restored as ghost files */
+ 	flags &= ~O_TMPFILE;
+-
++	pr_info("openat path is: %s\n", rfi->path);
+ 	fd = openat(ns_root_fd, rfi->path, flags);
+ 	if (fd < 0) {
+ 		pr_perror("Can't open file %s on restore", rfi->path);
+@@ -2307,6 +2307,7 @@ int collect_filemap(struct vma_area *vma)
+ 	if (!fd)
+ 		return -1;
+ 
++	pr_info("find fd for %lx, shmid: %lx\n", vma->e->start, vma->e->shmid);
+ 	vma->vmfd = fd;
+ 	vma->vm_open = open_filemap;
+ 	return 0;
+diff --git a/criu/include/image.h b/criu/include/image.h
+index 14659db..f598de7 100644
+--- a/criu/include/image.h
++++ b/criu/include/image.h
+@@ -84,6 +84,7 @@
+ #define VMA_AREA_VVAR	 (1 << 12)
+ #define VMA_AREA_AIORING (1 << 13)
+ #define VMA_AREA_MEMFD	 (1 << 14)
++#define VMA_AREA_ANON_INODE (1 << 15)
+ 
+ #define VMA_CLOSE	  (1 << 28)
+ #define VMA_NO_PROT_WRITE (1 << 29)
+diff --git a/criu/include/mem.h b/criu/include/mem.h
+index 03574ea..ccf8da6 100644
+--- a/criu/include/mem.h
++++ b/criu/include/mem.h
+@@ -45,6 +45,7 @@ extern int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_l
+ struct task_restore_args;
+ int open_vmas(struct pstree_item *t);
+ int prepare_vmas(struct pstree_item *t, struct task_restore_args *ta);
++int prepare_vma_names(struct pstree_item *t, struct task_restore_args *ta);
+ int unmap_guard_pages(struct pstree_item *t);
+ int prepare_mappings(struct pstree_item *t);
+ bool should_dump_page(VmaEntry *vmae, u64 pme);
+diff --git a/criu/include/restorer.h b/criu/include/restorer.h
+index 2f7345b..a81cc1b 100644
+--- a/criu/include/restorer.h
++++ b/criu/include/restorer.h
+@@ -134,6 +134,10 @@ struct restore_vma_io {
+ 
+ #define RIO_SIZE(niovs) (sizeof(struct restore_vma_io) + (niovs) * sizeof(struct iovec))
+ 
++struct vma_names {
++	char name[PATH_MAX];
++};
++
+ struct task_restore_args {
+ 	struct thread_restore_args *t; /* thread group leader */
+ 
+@@ -157,6 +161,8 @@ struct task_restore_args {
+ 	VmaEntry *vmas;
+ 	unsigned int vmas_n;
+ 
++	struct vma_names *vma_names;
++
+ 	int vma_ios_fd;
+ 	struct restore_vma_io *vma_ios;
+ 	unsigned int vma_ios_n;
+diff --git a/criu/mem.c b/criu/mem.c
+index 07efdbe..00965f0 100644
+--- a/criu/mem.c
++++ b/criu/mem.c
+@@ -525,6 +525,9 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
+ 			continue;
+ 		}
+ 
++		if (vma_entry_is(vma_area->e, VMA_AREA_ANON_INODE))
++			continue;
++
+ 		ret = generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
+ 					parent_predump_mode);
+ 		if (ret < 0)
+@@ -1355,6 +1358,9 @@ int open_vmas(struct pstree_item *t)
+ 	filemap_ctx_init(false);
+ 
+ 	list_for_each_entry(vma, &vmas->h, list) {
++		if (vma_area_is(vma, VMA_AREA_ANON_INODE))
++			continue;
++
+ 		if (!vma_area_is(vma, VMA_AREA_REGULAR) || !vma->vm_open)
+ 			continue;
+ 
+@@ -1437,3 +1443,20 @@ int prepare_vmas(struct pstree_item *t, struct task_restore_args *ta)
+ 
+ 	return prepare_vma_ios(t, ta);
+ }
++
++int prepare_vma_names(struct pstree_item *t, struct task_restore_args *ta)
++{
++	struct vma_area *vma;
++	struct vm_area_list *vmas = &rsti(t)->vmas;
++	ta->vma_names = (struct vma_names *)rst_mem_align_cpos(RM_PRIVATE);
++
++	list_for_each_entry(vma, &vmas->h, list) {
++		struct vma_names *vma_names;
++		vma_names = rst_mem_alloc(sizeof(*vma_names), RM_PRIVATE);
++		if (!vma_names)
++			return -1;
++
++		memcpy(vma_names->name, vma->e->name, strlen(vma->e->name) + 1);
++	}
++	return 0;
++}
+diff --git a/criu/pie/restorer.c b/criu/pie/restorer.c
+index 4a1d38d..549bbd6 100644
+--- a/criu/pie/restorer.c
++++ b/criu/pie/restorer.c
+@@ -68,6 +68,27 @@
+ #define FALLOC_FL_PUNCH_HOLE 0x02
+ #endif
+ 
++#define ANON_PROC_PATH	"/sys/kernel/modrestore/anon_state_restore"
++
++static int restore_anon_mapping(VmaEntry *vma_entry, struct vma_names *vma_name)
++{
++	int fd;
++
++	fd = sys_open(ANON_PROC_PATH, O_WRONLY, 0);
++	if (fd < 0) {
++		pr_info("anon sys fs open fail:%s\n", ANON_PROC_PATH);
++		return fd;
++	}
++	pr_info("restore anon mapping: %s\n", vma_name->name);
++
++	if (sys_write(fd, vma_name->name, 4096) < 0) {
++		sys_close(fd);
++		return -1;
++	}
++	sys_close(fd);
++	return 0;
++}
++
+ #define sys_prctl_safe(opcode, val1, val2, val3)                                \
+ 	({                                                                      \
+ 		long __ret = sys_prctl(opcode, val1, val2, val3, 0);            \
+@@ -1348,6 +1369,10 @@ static bool can_restore_vdso(struct task_restore_args *args)
+ 	}
+ 
+ 	/*
++	 * pr_info("anon vma name:%s\n", vma_name->name);
++	 * if (restore_anon_mapping(vma_entry, vma_name) < 0)
++	 * goto core_restore_end;
++	 * continue;
+ 	 * There is a use-case for restoring vvar alone: valgrind (see #488).
+ 	 * On the other side, we expect that vvar is touched by application
+ 	 * only from vdso. So, we can put a stale page and proceed restore
+@@ -1528,6 +1553,7 @@ long __export_restore_task(struct task_restore_args *args)
+ 	pid_t my_pid = sys_getpid();
+ 	rt_sigaction_t act;
+ 	bool has_vdso_proxy;
++	struct vma_names *vma_name;
+ 
+ 	futex_set(&thread_inprogress, 1);
+ 	futex_set(&thread_start, 0);
+@@ -1667,6 +1693,14 @@ long __export_restore_task(struct task_restore_args *args)
+ 	 */
+ 	for (i = 0; i < args->vmas_n; i++) {
+ 		vma_entry = args->vmas + i;
++		vma_name = args->vma_names + i;
++
++		if (vma_entry_is(vma_entry, VMA_AREA_ANON_INODE)) {
++			pr_info("anon vma name:%s\n", vma_name->name);
++			if (restore_anon_mapping(vma_entry, vma_name) < 0)
++				goto core_restore_end;
++			continue;
++		}
+ 
+ 		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR) && !vma_entry_is(vma_entry, VMA_AREA_AIORING))
+ 			continue;
+@@ -1784,6 +1818,9 @@ long __export_restore_task(struct task_restore_args *args)
+ 		if (!vma_entry->has_madv || !vma_entry->madv)
+ 			continue;
+ 
++		if (vma_entry_is(vma_entry, VMA_AREA_ANON_INODE))
++			continue;
++
+ 		for (m = 0; m < sizeof(vma_entry->madv) * 8; m++) {
+ 			if (vma_entry->madv & (1ul << m)) {
+ 				ret = sys_madvise(vma_entry->start, vma_entry_len(vma_entry), m);
+diff --git a/criu/proc_parse.c b/criu/proc_parse.c
+index f3491e7..e41d43a 100644
+--- a/criu/proc_parse.c
++++ b/criu/proc_parse.c
+@@ -76,6 +76,7 @@ static char *buf = __buf.buf;
+  */
+ 
+ #define AIO_FNAME "/[aio]"
++#define ANON_FNAME "anon_inode"
+ 
+ /* check the @line starts with "%lx-%lx" format */
+ static bool __is_vma_range_fmt(char *line)
+@@ -171,8 +172,17 @@ static void parse_vma_vmflags(char *buf, struct vma_area *vma_area)
+ 	 * only exception is VVAR area that mapped by the kernel as
+ 	 * VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP
+ 	 */
+-	if (io_pf && !vma_area_is(vma_area, VMA_AREA_VVAR) && !vma_entry_is(vma_area->e, VMA_FILE_SHARED))
+-		vma_area->e->status |= VMA_UNSUPP;
++	/* There are many types of io/pf vm_map, not only vvar, but also
++	 * anon_inode, and char device.
++	 * For anon_inode and char device, we use anon_notifier to restore
++	 * status. Therefore, we disable the broken code here.
++	 */
++//       if (io_pf && !vma_area_is(vma_area, VMA_AREA_VVAR) &&
++//               !vma_area_is(vma_area, VMA_AREA_ANON_INODE))
++//       {
++//               pr_info("set current status tp VMA_UNSUPP\n");
++//               vma_area->e->status |= VMA_UNSUPP;
++//       }
+ 
+ 	if (vma_area->e->madv)
+ 		vma_area->e->has_madv = true;
+@@ -437,6 +447,21 @@ static int vma_get_mapfile(const char *fname, struct vma_area *vma, DIR *mfd, st
+ 				return 0;
+ 			}
+ 
++			if (!strncmp(fname, ANON_FNAME, sizeof(ANON_FNAME) - 1)) {
++				/*anon_inode*/
++				close_safe(vm_file_fd);
++				vma->e->status = VMA_AREA_ANON_INODE;
++				vma->e->name = xmalloc(PATH_MAX);
++				if (!vma->e->name) {
++					pr_err("alloc vma name of anon-inode fail.\n");
++					return -1;
++				}
++				snprintf(vma->e->name, PATH_MAX - 1, "%"PRIx64"-%"PRIx64  "  %s", vma->e->start, vma->e->end, fname);
++				vma->e->name[PATH_MAX - 1] = 0;
++				pr_info("set vma_area status to: %d, name:%s\n", vma->e->status, vma->e->name);
++				return 0;
++			}
++
+ 			pr_err("Unknown shit %o (%s)\n", buf.st_mode, fname);
+ 			return -1;
+ 		}
+@@ -566,6 +591,7 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
+ 		vma_area->e->shmid = prev->e->shmid;
+ 		vma_area->vmst = prev->vmst;
+ 		vma_area->mnt_id = prev->mnt_id;
++		vma_area->e->name = prev->e->name;
+ 
+ 		if (!(vma_area->e->status & VMA_AREA_SYSVIPC)) {
+ 			vma_area->e->status &= ~(VMA_FILE_PRIVATE | VMA_FILE_SHARED);
+@@ -728,7 +754,6 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
+ 		if (IS_ERR(str))
+ 			goto err;
+ 		eof = (str == NULL);
+-
+ 		if (!eof && !__is_vma_range_fmt(str)) {
+ 			if (!strncmp(str, "Nonlinear", 9)) {
+ 				BUG_ON(!vma_area);
+diff --git a/images/vma.proto b/images/vma.proto
+index 0c07d51..1aa30f9 100644
+--- a/images/vma.proto
++++ b/images/vma.proto
+@@ -24,4 +24,5 @@ message vma_entry {
+ 
+ 	/* file status flags */
+ 	optional uint32		fdflags	= 10 [(criu).hex = true];
++	required string		name	= 11;
+ }
+-- 
+2.34.1
+

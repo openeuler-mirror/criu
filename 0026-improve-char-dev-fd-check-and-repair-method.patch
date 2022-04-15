@@ -1,0 +1,74 @@
+From 539add7149df575d6d8cdce60ad6fb2c2300e27d Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Sun, 24 Oct 2021 15:20:27 +0800
+Subject: [PATCH 26/72] improve char dev fd check and repair method
+
+Some special char dev cannot work in child processes, we make dump fail
+when the special char dev fd is in child processes.
+In the char dev repair process, user may need recover fd. We should
+make thre repair process running after the char dev fd is reopened as dumped fd.
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/21
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+---
+ criu/files-chr.c | 11 +----------
+ criu/files.c     | 12 ++++++++++++
+ 2 files changed, 13 insertions(+), 10 deletions(-)
+
+diff --git a/criu/files-chr.c b/criu/files-chr.c
+index 2eb023e..315e9c6 100644
+--- a/criu/files-chr.c
++++ b/criu/files-chr.c
+@@ -31,17 +31,8 @@ static int chrfile_open(struct file_desc *d, int *new_fd)
+ 		return -1;
+ 	}
+ 
+-	if (ci->cfe->repair) {
+-		ret = ioctl(fd, IOCTL_CMD_REPAIR , ci->cfe->index);
+-		pr_info("repair ioctl return: %d, index: %d\n", ret, ci->cfe->index);
+-		if (ret)
+-			goto err;
+-	}
+-
+ 	*new_fd = fd;
+-	return ret;
+-err:
+-	close(fd);
++
+ 	return ret;
+ }
+ 
+diff --git a/criu/files.c b/criu/files.c
+index e1681a1..7b688f5 100644
+--- a/criu/files.c
++++ b/criu/files.c
+@@ -1231,6 +1231,7 @@ static int open_fd(struct fdinfo_list_entry *fle)
+ 	struct file_desc *d = fle->desc;
+ 	struct fdinfo_list_entry *flem;
+ 	int new_fd = -1, ret;
++	struct chrfile_info *ci;
+ 
+ 	flem = file_master(d);
+ 	if (fle != flem) {
+@@ -1258,6 +1259,17 @@ static int open_fd(struct fdinfo_list_entry *fle)
+ 	if (ret != -1 && new_fd >= 0) {
+ 		if (setup_and_serve_out(fle, new_fd) < 0)
+ 			return -1;
++		if (d->ops->type == FD_TYPES__CHR) {
++			ci = container_of(d, struct chrfile_info, d);
++			if (ci->cfe->repair) {
++				ret = ioctl(fle->fe->fd, IOCTL_CMD_REPAIR , ci->cfe->index);
++				pr_info("repair ioctl return: %d, index: %d\n", ret, ci->cfe->index);
++				if (ret) {
++					close(fle->fe->fd);
++					return -1;
++				}
++			}
++		}
+ 	}
+ out:
+ 	if (ret == 0)
+-- 
+2.34.1
+

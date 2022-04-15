@@ -1,0 +1,505 @@
+From ade879e6ccdc4c74a1c153f0750d2cd87ec8a4ec Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Tue, 30 Nov 2021 10:26:10 +0800
+Subject: [PATCH 52/72] optimization: parallel collecting vmas
+
+In order to improve criu dump performance, make the collecting vmas
+operation parallel run with the other collecting operations.
+
+In order to prevent the concurrency problem by `find_unused_fd`, only
+the main root task will parallel.
+
+Usage:
+  criu --parallel
+
+Note:
+  Ensure criu can use multi-core, otherwise the performance will
+deterioration.
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+Signed-off-by: hewenliang <hewenliang4@huawei.com>
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+---
+ criu/Makefile.crtools     |   1 +
+ criu/Makefile.packages    |   1 +
+ criu/config.c             |   1 +
+ criu/cr-dump.c            |  53 +++++++++++-----
+ criu/crtools.c            |   1 +
+ criu/include/cr_options.h |   1 +
+ criu/include/pstree.h     |   3 +
+ criu/include/taskqueue.h  |  50 +++++++++++++++
+ criu/namespaces.c         |   9 ++-
+ criu/taskqueue.c          | 124 ++++++++++++++++++++++++++++++++++++++
+ 10 files changed, 228 insertions(+), 16 deletions(-)
+ create mode 100644 criu/include/taskqueue.h
+ create mode 100644 criu/taskqueue.c
+
+diff --git a/criu/Makefile.crtools b/criu/Makefile.crtools
+index 3bb7c19..2ad0207 100644
+--- a/criu/Makefile.crtools
++++ b/criu/Makefile.crtools
+@@ -97,6 +97,7 @@ obj-y			+= exit-notify.o
+ obj-y			+= reserved-ports.o
+ obj-y			+= orphan-inode.o
+ obj-y			+= kmsg.o
++obj-y			+= taskqueue.o
+ obj-$(CONFIG_HAS_LIBBPF)	+= bpfmap.o
+ obj-$(CONFIG_COMPAT)	+= pie-util-vdso-elf32.o
+ CFLAGS_pie-util-vdso-elf32.o	+= -DCONFIG_VDSO_32
+diff --git a/criu/Makefile.packages b/criu/Makefile.packages
+index 13c346f..851489b 100644
+--- a/criu/Makefile.packages
++++ b/criu/Makefile.packages
+@@ -31,6 +31,7 @@ REQ-RPM-PKG-TEST-NAMES	+= $(PYTHON)-pyyaml
+ endif
+ 
+ export LIBS		+= -lprotobuf-c -ldl -lnl-3 -lsoccr -Lsoccr/ -lnet
++export LIBS		+= -lpthread
+ 
+ check-packages-failed:
+ 	$(warning Can not find some of the required libraries)
+diff --git a/criu/config.c b/criu/config.c
+index ae5f81e..fdbc5eb 100644
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -709,6 +709,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		{ "share-dst-ports", required_argument, 0, 2000 },
+ 		{ "share-src-ports", required_argument, 0, 2001 },
+ 		{ "reserve-ports", required_argument, 0, 'P' },
++		BOOL_OPT("parallel", &opts.parallel),
+ 		{},
+ 	};
+ 
+diff --git a/criu/cr-dump.c b/criu/cr-dump.c
+index a8ab61e..ee826c0 100644
+--- a/criu/cr-dump.c
++++ b/criu/cr-dump.c
+@@ -17,6 +17,7 @@
+ 
+ #include <sched.h>
+ #include <sys/resource.h>
++#include <sys/sysinfo.h>
+ 
+ #include "types.h"
+ #include "protobuf.h"
+@@ -90,6 +91,7 @@
+ #include "notifier.h"
+ #include "files-chr.h"
+ #include "reserved-ports.h"
++#include "taskqueue.h"
+ 
+ /*
+  * Architectures can overwrite this function to restore register sets that
+@@ -424,7 +426,7 @@ static int dump_pid_misc(pid_t pid, TaskCoreEntry *tc)
+ 	return 0;
+ }
+ 
+-static int dump_filemap(struct vma_area *vma_area, int fd)
++int dump_filemap(struct vma_area *vma_area, int fd)
+ {
+ 	struct fd_parms p = FD_PARMS_INIT;
+ 	VmaEntry *vma = vma_area->e;
+@@ -1504,7 +1506,7 @@ err_cure:
+ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
+ {
+ 	pid_t pid = item->pid->real;
+-	struct vm_area_list vmas;
++	struct vm_area_list *vmas = NULL;
+ 	struct parasite_ctl *parasite_ctl;
+ 	int ret, exit_code = -1;
+ 	struct parasite_dump_misc misc;
+@@ -1513,8 +1515,6 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
+ 	struct proc_posix_timers_stat proc_args;
+ 	struct mem_dump_ctl mdc;
+ 
+-	vm_area_list_init(&vmas);
+-
+ 	pr_info("========================================\n");
+ 	pr_info("Dumping task (pid: %d)\n", pid);
+ 	pr_info("========================================\n");
+@@ -1525,12 +1525,23 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
+ 		 */
+ 		return 0;
+ 
++	if (!opts.parallel || root_item->pid->real != item->pid->real ) {
++		vmas = xmalloc(sizeof(struct vm_area_list));
++		if (vmas == NULL) {
++			pr_err("xmalloc no memory\n");
++			return -1;
++		}
++		vm_area_list_init(vmas);
++	} else
++		vmas = item->maps_info.vmas;
++
+ 	pr_info("Obtaining task stat ... \n");
+ 	ret = parse_pid_stat(pid, &pps_buf);
+ 	if (ret < 0)
+ 		goto err;
+ 
+-	ret = collect_mappings(pid, &vmas, dump_filemap);
++	ret = (opts.parallel && root_item->pid->real == item->pid->real) ?
++				0 : collect_mappings(pid, vmas, dump_filemap);
+ 	if (ret) {
+ 		pr_err("Collect mappings (pid: %d) failed with %d\n", pid, ret);
+ 		goto err;
+@@ -1570,7 +1581,10 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
+ 		goto err;
+ 	}
+ 
+-	parasite_ctl = parasite_infect_seized(pid, item, &vmas);
++	if (opts.parallel && end_collect_mappings_thread(item))
++		goto err;
++
++	parasite_ctl = parasite_infect_seized(pid, item, vmas);
+ 	if (!parasite_ctl) {
+ 		pr_err("Can't infect (pid: %d) with parasite\n", pid);
+ 		goto err;
+@@ -1600,13 +1614,13 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
+ 			goto err_cure_imgset;
+ 	}
+ 
+-	ret = parasite_fixup_vdso(parasite_ctl, pid, &vmas);
++	ret = parasite_fixup_vdso(parasite_ctl, pid, vmas);
+ 	if (ret) {
+ 		pr_err("Can't fixup vdso VMAs (pid: %d)\n", pid);
+ 		goto err_cure_imgset;
+ 	}
+ 
+-	ret = parasite_collect_aios(parasite_ctl, &vmas); /* FIXME -- merge with above */
++	ret = parasite_collect_aios(parasite_ctl, vmas); /* FIXME -- merge with above */
+ 	if (ret) {
+ 		pr_err("Failed to check aio rings (pid: %d)\n", pid);
+ 		goto err_cure_imgset;
+@@ -1658,7 +1672,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
+ 	mdc.stat = &pps_buf;
+ 	mdc.parent_ie = parent_ie;
+ 
+-	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
++	ret = parasite_dump_pages_seized(item, vmas, &mdc, parasite_ctl);
+ 	if (ret)
+ 		goto err_cure;
+ 
+@@ -1719,7 +1733,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
+ 		goto err;
+ 	}
+ 
+-	ret = dump_task_mm(pid, &pps_buf, &misc, &vmas, cr_imgset);
++	ret = dump_task_mm(pid, &pps_buf, &misc, vmas, cr_imgset);
+ 	if (ret) {
+ 		pr_err("Dump mappings (pid: %d) failed with %d\n", pid, ret);
+ 		goto err;
+@@ -1735,7 +1749,8 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
+ 	exit_code = 0;
+ err:
+ 	close_pid_proc();
+-	free_mappings(&vmas);
++	free_mappings(vmas);
++	free(vmas);
+ 	xfree(dfds);
+ 	return exit_code;
+ 
+@@ -1893,6 +1908,9 @@ int cr_pre_dump_tasks(pid_t pid)
+ 	if (opts.dump_char_dev && parse_devname() < 0)
+ 		goto err;
+ 
++	if (opts.parallel && init_parallel_env() != 0)
++		goto err;
++
+ 	root_item = alloc_pstree_item();
+ 	if (!root_item)
+ 		goto err;
+@@ -2107,6 +2125,13 @@ static int cr_dump_finish(int ret)
+ 		write_stats(DUMP_STATS);
+ 		pr_info("Dumping finished successfully\n");
+ 	}
++
++	/*
++	 * Don't care threads' status and ignore unfree resources, use
++	 * `exit_group()` to ensure exit all threads.
++	 */
++	syscall(SYS_exit_group, post_dump_ret ? : (ret != 0));
++
+ 	return post_dump_ret ?: (ret != 0);
+ }
+ 
+@@ -2203,13 +2228,13 @@ int cr_dump_tasks(pid_t pid)
+ 	if (collect_file_locks())
+ 		goto err;
+ 
+-	if (collect_namespaces(true) < 0)
+-		goto err;
+-
+ 	glob_imgset = cr_glob_imgset_open(O_DUMP);
+ 	if (!glob_imgset)
+ 		goto err;
+ 
++	if (collect_namespaces(true) < 0)
++		goto err;
++
+ 	if (seccomp_collect_dump_filters() < 0)
+ 		goto err;
+ 
+diff --git a/criu/crtools.c b/criu/crtools.c
+index cc0a18f..c20b3b7 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -472,6 +472,7 @@ usage:
+ 	       "  --weak-file-check	Allow file size and mod larger than dumping value\n"
+ 	       "  --file-locks-repair	Use repair mode to dump and restore file locks\n"
+ 	       "  --reserve-ports	Reserve src ports in kernel\n"
++	       "  --parallel		Collect smaps parallel to accellrate dumping speed\n"
+ 	       "\n"
+ 	       "Check options:\n"
+ 	       "  Without options, \"criu check\" checks availability of absolutely required\n"
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index 3b61c6b..6478d4d 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -201,6 +201,7 @@ struct cr_options {
+ 	char *share_dst_ports;
+ 	char *share_src_ports;
+ 	int reserve_ports;
++	int parallel;
+ };
+ 
+ extern struct cr_options opts;
+diff --git a/criu/include/pstree.h b/criu/include/pstree.h
+index 97bef11..87e4c47 100644
+--- a/criu/include/pstree.h
++++ b/criu/include/pstree.h
+@@ -1,6 +1,8 @@
+ #ifndef __CR_PSTREE_H__
+ #define __CR_PSTREE_H__
+ 
++#include "taskqueue.h"
++
+ #include "common/list.h"
+ #include "common/lock.h"
+ #include "pid.h"
+@@ -31,6 +33,7 @@ struct pstree_item {
+ 		futex_t task_st;
+ 		unsigned long task_st_le_bits;
+ 	};
++	struct mappings_info maps_info;
+ };
+ 
+ static inline pid_t vpid(const struct pstree_item *i)
+diff --git a/criu/include/taskqueue.h b/criu/include/taskqueue.h
+new file mode 100644
+index 0000000..16f9e3d
+--- /dev/null
++++ b/criu/include/taskqueue.h
+@@ -0,0 +1,50 @@
++#ifndef __CR_TASKQUEUE_H__
++#define __CR_TASKQUEUE_H__
++
++#include <stdbool.h>
++#include <pthread.h>
++#include <semaphore.h>
++
++#include "vma.h"
++#include "pstree.h"
++
++#include "common/list.h"
++
++#define TASKQUEUE_HASH_SIZE	8
++
++struct taskqueue {
++	pthread_t task;
++	void *(*routine)(void *);
++	void *arg;
++	int result;
++};
++#define queue_task	queue.task
++#define queue_routine	queue.routine
++#define queue_arg	queue.arg
++#define queue_result	queue.result
++
++int init_parallel_env(void);
++
++static inline int taskqueue_create(struct taskqueue *queue)
++{
++	return pthread_create(&queue->task, NULL, queue->routine, queue->arg);
++}
++
++static inline int taskqueue_join(struct taskqueue *queue)
++{
++	return pthread_join(queue->task, NULL);
++}
++
++/* parallel collect smaps */
++struct mappings_info {
++	struct hlist_node hash;
++	pid_t pid;
++	struct vm_area_list *vmas;
++	dump_filemap_t dump_file;
++	struct taskqueue queue;
++};
++
++int start_collect_mappings_thread(void);
++int end_collect_mappings_thread(struct pstree_item *item);
++
++#endif /* __CR_TASKQUEUE_H__ */
+diff --git a/criu/namespaces.c b/criu/namespaces.c
+index 7fa5868..05e6732 100644
+--- a/criu/namespaces.c
++++ b/criu/namespaces.c
+@@ -28,6 +28,7 @@
+ #include "cgroup.h"
+ #include "fdstore.h"
+ #include "kerndat.h"
++#include "taskqueue.h"
+ 
+ #include "protobuf.h"
+ #include "util.h"
+@@ -1607,11 +1608,15 @@ int collect_namespaces(bool for_dump)
+ {
+ 	int ret;
+ 
+-	ret = collect_user_namespaces(for_dump);
++	ret = collect_mnt_namespaces(for_dump);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = collect_mnt_namespaces(for_dump);
++	/* need mnt info provided by `mntinfo` */
++	if (opts.parallel && start_collect_mappings_thread())
++		return -1;
++
++	ret = collect_user_namespaces(for_dump);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff --git a/criu/taskqueue.c b/criu/taskqueue.c
+new file mode 100644
+index 0000000..1196a5e
+--- /dev/null
++++ b/criu/taskqueue.c
+@@ -0,0 +1,124 @@
++/*
++ * Target:
++ *   parallel dump process
++ */
++
++#include <string.h>
++#include <errno.h>
++#include <pthread.h>
++#include <sys/sysinfo.h>
++
++#include "pstree.h"
++#include "log.h"
++#include "taskqueue.h"
++
++/*
++ * Sometimes, only one cpu can be used which is bad for parallel routine.
++ * Therefore, set cpu affinity for criu routine.
++ */
++static int set_cpuaffinity(void)
++{
++	cpu_set_t *set;
++	int num_cpus = get_nprocs_conf();
++	size_t cpusetsize = CPU_ALLOC_SIZE(num_cpus);
++	int retval;
++
++	set = CPU_ALLOC(num_cpus);
++	memset(set, 0xff, cpusetsize);
++
++	retval = sched_setaffinity(getpid(), cpusetsize, set);
++	if (retval != 0)
++		pr_err("sched_setaffinity failed: %s\n", strerror(errno));
++
++	CPU_FREE(set);
++
++	return retval;
++}
++
++int init_parallel_env(void)
++{
++	return set_cpuaffinity();
++}
++
++static void *collect_mappings_routine(void *_arg)
++{
++	struct mappings_info *info = _arg;
++
++	info->queue_result = collect_mappings(info->pid, info->vmas, info->dump_file);
++	return NULL;
++}
++
++int dump_filemap(struct vma_area *vma_area, int fd); /* defined in criu/cr-dump.c */
++
++int start_collect_mappings_thread(void)
++{
++	struct pstree_item *pi;
++	struct mappings_info *info;
++
++	for_each_pstree_item(pi) {
++		/* disable parallel collect for non-root item because of the
++		 * concurrence.
++		 */
++		if (pi->pid->real != root_item->pid->real)
++			continue;
++
++		info = &pi->maps_info;
++
++		info->vmas = xmalloc(sizeof(struct vm_area_list));
++		if (info->vmas == NULL) {
++			pr_err("xzalloc vmas no memory\n");
++			return -1;
++		}
++		vm_area_list_init(info->vmas);
++
++		info->pid = pi->pid->real;
++		info->dump_file = dump_filemap;
++		info->queue_routine = collect_mappings_routine;
++		info->queue_arg = info;
++
++		pr_info("Start thread to collect %d mappings\n", info->pid);
++
++		if (taskqueue_create(&info->queue) < 0) {
++			pr_err("parallel_collect_mappings failed: %s\n", strerror(errno));
++			free(info->vmas);
++			/*
++			 * Don't care other threads status, use `exit_group()`
++			 * to ensure all threads exit.
++			 */
++			return -1;
++		}
++	}
++
++	return 0;
++}
++
++int end_collect_mappings_thread(struct pstree_item *item)
++{
++	struct mappings_info *info = &item->maps_info;
++	int retval;
++
++	/* disable parallel collect for non-root item because of the
++	 * concurrence.
++	 */
++	if (root_item->pid->real != item->pid->real)
++		return 0;
++
++	retval = taskqueue_join(&info->queue);
++	if (retval != 0 || info->queue_result != 0) {
++		pr_err("taskqueue_join failed, retval %d(errno %d: %s),"
++			       " queue_result: %d\n",
++			retval,
++			retval == 0 ? 0 : errno,
++			retval == 0 ? "nil" : strerror(errno),
++			info->queue_result);
++		retval = -1;
++	}
++
++	pr_info("End thread to collect %d mappings\n", info->pid);
++
++	/*
++	 * Don't care other threads status, use `exit_group()` to ensure all
++	 * threads exit.
++	 */
++	return retval;
++}
+-- 
+2.34.1
+

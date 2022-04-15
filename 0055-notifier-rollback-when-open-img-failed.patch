@@ -1,0 +1,150 @@
+From c79a274b378173ac64d42d1c72df1ec594085d66 Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Mon, 27 Dec 2021 21:34:39 +0800
+Subject: [PATCH 55/72] notifier: rollback when open img failed
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/26
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/cr-restore.c     | 69 +++++++++++++++++++++++++++++++++++++++++++
+ criu/include/pstree.h |  1 +
+ criu/pstree.c         |  8 +++++
+ 3 files changed, 78 insertions(+)
+
+diff --git a/criu/cr-restore.c b/criu/cr-restore.c
+index b0b3d30..13f0a93 100644
+--- a/criu/cr-restore.c
++++ b/criu/cr-restore.c
+@@ -1542,6 +1542,9 @@ static inline int fork_with_pid(struct pstree_item *item)
+ 		goto err_unlock;
+ 	}
+ 
++	/* disable criu rollback capability. */
++	criu_roll = false;
++
+ 	if (item == root_item) {
+ 		item->pid->real = ret;
+ 		pr_debug("PID: real %d virt %d\n", item->pid->real, vpid(item));
+@@ -2757,6 +2760,71 @@ int prepare_dummy_task_state(struct pstree_item *pi)
+ 	return 0;
+ }
+ 
++static int criu_rollback_internal(void *_arg)
++{
++	bool unmask = *(int *)_arg;
++	pid_t pid = getpid();
++
++	if (unmask && mask_task_exit_notify(pid, false) != 0)
++		pr_err("unmask exit notify failed for %d\n", pid);
++
++	do_notifier_rollback(true, POST_UPDATE_KERNEL_COMPLETE);
++	return 0;
++}
++
++static void criu_rollback(void)
++{
++	pid_t pid;
++	unsigned long clone_flags;
++	int retval = 0;
++
++	if (!criu_roll || !opts.with_notifier_kup)
++		return;
++
++	pid = vpid(root_item);
++	clone_flags = rsti(root_item)->clone_flags;
++
++	pr_info("do criu rollback\n");
++
++	/* Some rollback notifier must be call in the specific task context. */
++	if (opts.use_fork_pid)
++		retval = write_fork_pid(vpid(root_item));
++	else if (!kdat.has_clone3_set_tid)
++		retval = set_next_pid((void *)&pid);
++
++	if (retval < 0) {
++		pr_err("set next pid %d failed, can't do rollback.", pid);
++		return;
++	}
++
++	if (!kdat.has_clone3_set_tid) {
++		retval = clone_noasan(criu_rollback_internal,
++					clone_flags | SIGCHLD,
++					&opts.mask_exit_notify);
++	} else {
++		retval = clone3_with_pid_noasan(criu_rollback_internal,
++						&opts.mask_exit_notify,
++						clone_flags,
++						SIGCHLD, pid);
++	}
++	
++	if (retval < 0) {
++		pr_err("Can't fork for %d to do rollback: %s.\n",
++				pid, strerror(errno));
++	} else {
++		int status;
++
++		if (retval != pid)
++			pr_err("clone pid %d isn't equal with %d\n",
++					retval, pid);
++
++		if (waitpid(pid, &status, 0) < 0) {
++			pr_warn("Unable to wait %d: %s\n",
++					pid, strerror(errno));
++		}
++	}
++}
++
+ int cr_restore_tasks(void)
+ {
+ 	int ret = -1;
+@@ -2831,6 +2899,7 @@ clean_cgroup:
+ err:
+ 	cr_plugin_fini(CR_PLUGIN_STAGE__RESTORE, ret);
+ 	if (ret < 0) {
++		criu_rollback();
+ 		if (!!(network_status & NETWORK_COLLECTED)
+ 		    && !files_collected() && collect_image(&inet_sk_cinfo))
+ 			pr_err("collect inet sk cinfo fail\n");
+diff --git a/criu/include/pstree.h b/criu/include/pstree.h
+index 87e4c47..6c0765b 100644
+--- a/criu/include/pstree.h
++++ b/criu/include/pstree.h
+@@ -46,6 +46,7 @@ enum {
+ };
+ #define FDS_EVENT (1 << FDS_EVENT_BIT)
+ 
++extern bool criu_roll;
+ extern struct pstree_item *current;
+ 
+ struct rst_info;
+diff --git a/criu/pstree.c b/criu/pstree.c
+index 778c884..8992155 100644
+--- a/criu/pstree.c
++++ b/criu/pstree.c
+@@ -20,6 +20,11 @@
+ #include "images/pstree.pb-c.h"
+ #include "crtools.h"
+ 
++/*
++ * Sometimes, img may be broken, set flag here to enable roll capibility
++ * before forking restorer.
++ */
++bool criu_roll;
+ struct pstree_item *root_item;
+ static struct rb_root pid_root_rb;
+ 
+@@ -638,6 +643,9 @@ static int read_pstree_image(pid_t *pid_max)
+ 	if (!img)
+ 		return -1;
+ 
++	/* enable rollback capibility when opening img successfully. */
++	criu_roll = true;
++
+ 	do {
+ 		ret = read_one_pstree_item(img, pid_max);
+ 	} while (ret > 0);
+-- 
+2.34.1
+

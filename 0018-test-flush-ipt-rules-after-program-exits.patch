@@ -1,0 +1,52 @@
+From 003edcab5c2dc1a3f00dba7f4b7bcdd017eb34b5 Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Thu, 20 Jan 2022 19:45:14 +0800
+Subject: [PATCH 18/72] test: flush ipt rules after program exits
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ test/zdtm/static/socket-tcp-nfconntrack.desc |  2 +-
+ test/zdtm/static/socket-tcp.c                | 13 +++++++++++++
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/test/zdtm/static/socket-tcp-nfconntrack.desc b/test/zdtm/static/socket-tcp-nfconntrack.desc
+index add2513..05bdb49 100644
+--- a/test/zdtm/static/socket-tcp-nfconntrack.desc
++++ b/test/zdtm/static/socket-tcp-nfconntrack.desc
+@@ -1 +1 @@
+-{'flavor': 'h', 'opts': '--tcp-established', 'flags': 'suid'}
++{'flavor': 'h', 'opts': '--tcp-established', 'flags': 'suid excl'}
+diff --git a/test/zdtm/static/socket-tcp.c b/test/zdtm/static/socket-tcp.c
+index f6ef473..29b0fce 100644
+--- a/test/zdtm/static/socket-tcp.c
++++ b/test/zdtm/static/socket-tcp.c
+@@ -57,6 +57,13 @@ int write_data(int fd, const unsigned char *buf, int size)
+ 	return 0;
+ }
+ 
++#ifdef ZDTM_CONNTRACK
++static void ipt_flush(void)
++{
++	system("iptables -w --flush");
++}
++#endif
++
+ int main(int argc, char **argv)
+ {
+ 	unsigned char buf[BUF_SIZE];
+@@ -72,6 +79,12 @@ int main(int argc, char **argv)
+ 		pr_perror("unshare");
+ 		return 1;
+ 	}
++
++	if (atexit(ipt_flush) != 0) {
++		pr_perror("atexit");
++		return 1;
++	}
++
+ 	if (system("ip link set up dev lo"))
+ 		return 1;
+ 	if (system("iptables -w -A INPUT -i lo -p tcp -m state --state NEW,ESTABLISHED -j ACCEPT"))
+-- 
+2.34.1
+

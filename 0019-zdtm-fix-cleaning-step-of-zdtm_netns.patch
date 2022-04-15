@@ -1,0 +1,48 @@
+From 5e68ba283e442467baef762bfcf87910d84e01ae Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Wed, 19 Jan 2022 10:01:25 +0800
+Subject: [PATCH 19/72] zdtm: fix cleaning step of zdtm_netns
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ test/zdtm.py | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/test/zdtm.py b/test/zdtm.py
+index 0a52e1b..0feece0 100755
+--- a/test/zdtm.py
++++ b/test/zdtm.py
+@@ -1,4 +1,6 @@
+ #!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
+ from __future__ import absolute_import, division, print_function, unicode_literals
+ 
+ import argparse
+@@ -2110,7 +2112,8 @@ class Launcher:
+ 
+         if self.__fail:
+             print_sep("FAIL", "#")
+-            sys.exit(1)
++
++        return self.__fail
+ 
+ 
+ def all_tests(opts):
+@@ -2375,10 +2378,11 @@ def run_tests(opts):
+             else:
+                 launcher.skip(t, "no flavors")
+     finally:
+-        launcher.finish()
++        fail = launcher.finish()
+         if opts['join_ns']:
+             subprocess.Popen(["ip", "netns", "delete", "zdtm_netns"]).wait()
+-
++        if fail:
++            sys.exit(1)
+ 
+ sti_fmt = "%-40s%-10s%s"
+ 
+-- 
+2.34.1
+

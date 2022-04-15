@@ -1,0 +1,35 @@
+From d17aedda384cfe6940b9948f4db36643495e0375 Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Tue, 15 Feb 2022 11:31:27 +0800
+Subject: [PATCH 65/72] zdtm: print errno info when accessing *.out failure
+
+The line `Output file *.out appears to exist, aborting` is confusing.
+The one common reason is permission denied because of the test desc
+is lack of suid flag. The zdtm.py will set `ZDTM_UID` and `ZDTM_GID`,
+the function `test_init()` (in `zdtm/lib/test.c`) will change tester
+itself to that uid and gid if no suid flag.
+
+Here print the errno when access *.out failed.
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ test/zdtm/lib/test.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/test/zdtm/lib/test.c b/test/zdtm/lib/test.c
+index 81da81e..471980d 100644
+--- a/test/zdtm/lib/test.c
++++ b/test/zdtm/lib/test.c
+@@ -74,7 +74,8 @@ static void test_fini(void)
+ static void setup_outfile(void)
+ {
+ 	if (!access(outfile, F_OK) || errno != ENOENT) {
+-		fprintf(stderr, "Output file %s appears to exist, aborting\n", outfile);
++		fprintf(stderr, "Output file %s appears to exist, aborting: %s\n",
++			outfile, strerror(errno));
+ 		exit(1);
+ 	}
+ 
+-- 
+2.34.1
+

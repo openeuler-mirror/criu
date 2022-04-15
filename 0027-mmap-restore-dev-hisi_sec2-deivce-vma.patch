@@ -1,0 +1,472 @@
+From fe19a2639373175c134fa51a7c1c26ca5306d22c Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Fri, 10 Sep 2021 16:06:55 +0800
+Subject: [PATCH 27/72] mmap: restore /dev/hisi_sec2* deivce vma
+
+There are two kinds of vmas: anonymous vma and file-based vma. For
+anonymous vma, criu just map area and fill content to it; for file-based
+vma, criu preprocess it, such as setting `open_vm()` callback function.
+
+`/dev/hisi_sec2*` char device is different from the normal. The `open`,
+`mmap`, and `close` syscall actions has a special meaning.
+  - `open`: allocate physical resource of the device
+  - `mmap`: create instance
+  - `close`: release physical resource
+The vma means the instance in this device. One fd may be associated with
+a group instances: one mmio (vma size is 2 pages, pgoff is 0), one dus
+(vma size is 37 pages, pgoff is 0x2000). As for dus vma, it's split two
+vmas by `mprotect(addr, 0x5000, PROT_READ)`: one size is 0x20000, one
+size is 0x5000.
+
+This patch makes the /dev/hisi_sec* restore possible. Idea:
+  It's impossible for criu to know the relationship between vma and the
+mapped file fd. Therefore, just collect the total fds number during
+collecting /dev/hisi_sec* files, then the fd is tagged that which
+function is used during vma restoration, and aissign the unused fd to the
+specific vma. And during `mmap()` process, dus vma is splitted by `mprotect`.
+
+Note:
+- criu use ino to index the fd.
+- this physical device drivers is hisi_sec2.ko, which is located in
+  `drivers/crypto/hisilicon/sec2/` of linux kernel.
+- this device name has prefix "hisi_sec2" that is found from
+  `drivers/crypto/hisilicon/sec2/sec_main.c`.
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/21
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/files-chr.c         | 130 +++++++++++++++++++++++++++++++++++++--
+ criu/include/files-chr.h |  16 +++++
+ criu/include/vma.h       |  12 ++++
+ criu/pie/restorer.c      | 130 ++++++++++++++++++++++++++++++++++++++-
+ criu/proc_parse.c        |   4 +-
+ 5 files changed, 284 insertions(+), 8 deletions(-)
+
+diff --git a/criu/files-chr.c b/criu/files-chr.c
+index 315e9c6..95d93e1 100644
+--- a/criu/files-chr.c
++++ b/criu/files-chr.c
+@@ -6,6 +6,9 @@
+ #include "log.h"
+ 
+ #include "protobuf.h"
++#include "rst-malloc.h"
++
++static unsigned hisi_sec_fds_n;
+ 
+ /* Checks if file descriptor @lfd is infinibandevent */
+ int is_infiniband_link(char *link)
+@@ -16,11 +19,14 @@ int is_infiniband_link(char *link)
+ static int chrfile_open(struct file_desc *d, int *new_fd)
+ {
+ 	int fd, mntns_root;
+-	int ret = 0;
++	int ret = -1;
+ 	struct chrfile_info *ci;
+ 
+ 	ci = container_of(d, struct chrfile_info, d);
+ 
++	pr_info("charfile: Opening %s (repair %d index %d)\n",
++			ci->path, ci->cfe->repair, ci->cfe->index);
++
+ 	if (ci->cfe->repair)
+ 		ci->cfe->flags |= O_REPAIR;
+ 
+@@ -32,6 +38,7 @@ static int chrfile_open(struct file_desc *d, int *new_fd)
+ 	}
+ 
+ 	*new_fd = fd;
++	ret = 0;
+ 
+ 	return ret;
+ }
+@@ -52,10 +59,12 @@ static int collect_one_chrfile(void *o, ProtobufCMessage *base, struct cr_img *i
+ 	else
+ 		ci->path = ci->cfe->name;
+ 
+-	pr_info("Collected chr file: %#x, name: %s\n", ci->cfe->id, ci->path);
+-	file_desc_add(&ci->d, ci->cfe->id, &chrfile_desc_ops);
++	/* collect `/dev/hisi_sec2*` fds */
++	if (strstr(ci->path, HISI_SEC_DEV) != NULL)
++		hisi_sec_fds_n += 1;
+ 
+-	return 0;
++	pr_info("Collected chr file: %#x, name: %s\n", ci->cfe->id, ci->path);
++	return file_desc_add(&ci->d, ci->cfe->id, &chrfile_desc_ops);
+ }
+ 
+ struct collect_image_info chrfile_cinfo = {
+@@ -65,6 +74,7 @@ struct collect_image_info chrfile_cinfo = {
+ 	.collect = collect_one_chrfile,
+ };
+ 
++static int handle_hisi_vma(struct list_head *fds, struct vma_area *vma);
+ int collect_chr_map(struct pstree_item *me, struct vma_area *vma)
+ {
+ 	struct list_head *list = &rsti(me)->fds;
+@@ -72,6 +82,12 @@ int collect_chr_map(struct pstree_item *me, struct vma_area *vma)
+ 	struct chrfile_info *ci;
+ 	bool exist_fd;
+ 
++	if (strstr(vma->e->name, HISI_SEC_DEV) != NULL) {
++		if (handle_hisi_vma(list, vma) != 0) {
++			return -1;
++		} else
++			goto out;
++	}
+ 
+ 	list_for_each_entry_safe(fle, tmp, list, ps_list) {
+ 		struct file_desc *d = fle->desc;
+@@ -91,5 +107,111 @@ int collect_chr_map(struct pstree_item *me, struct vma_area *vma)
+ 	if (!exist_fd)
+ 		return -EEXIST;
+ 
++out:
++	pr_info("  `- find fd %ld for dev %s at this vma\n", vma->e->fd, vma->e->name);
++
++	return 0;
++}
++
++#define MAX_HISI_SEC_SIZE	3 /* one physical device expose three char dev */
++static struct hlist_head hisi_sec_fds_hash[MAX_HISI_SEC_SIZE];
++
++static int collect_hisi_sec_fds(struct list_head *list)
++{
++	struct fdinfo_list_entry *fle, *tmp;
++	struct chrfile_info *ci;
++	struct file_desc *d;
++	struct hisi_sec_desc *desc;
++	int idx;
++	int nr = 0;
++
++	for (idx = 0; idx < MAX_HISI_SEC_SIZE; idx++)
++		INIT_HLIST_HEAD(&hisi_sec_fds_hash[idx]);
++
++	list_for_each_entry_safe(fle, tmp, list, ps_list) {
++		d = fle->desc;
++
++		if (d->ops->type != FD_TYPES__CHR)
++			continue;
++
++		ci = container_of(d, struct chrfile_info, d);
++
++		if (strstr(ci->path, HISI_SEC_DEV) != NULL) {
++			desc = shmalloc(sizeof(*desc));
++			if (desc == NULL)
++				return -ENOMEM;
++
++			desc->name = ci->path;
++			desc->fd = fle->fe->fd;
++			desc->mmio = desc->dus = 0;
++
++			idx = (ci->path[strlen(ci->path)-1] - '0') % MAX_HISI_SEC_SIZE;
++			hlist_add_head(&desc->hash, &hisi_sec_fds_hash[idx]);
++
++			nr += 1;
++		}
++	}
++
++	return nr;
++}
++
++static long delivery_hisi_sec_fd(struct list_head *fds, struct vma_area *vma)
++{
++	extern unsigned hisi_sec_fds_n; /* defined in criu/files.c */
++	static bool initialized  = false;
++	struct hisi_sec_desc *desc;
++	int fd = -1, idx;
++
++	if (!initialized) {
++		int nr;
++
++		pr_info("find %d fds for hisi_sec char device\n", hisi_sec_fds_n);
++
++		nr = collect_hisi_sec_fds(fds);
++		if (nr != hisi_sec_fds_n) {
++			pr_err("Collected fds(%d) aren't equal opened(%d)\n",
++			       nr, hisi_sec_fds_n);
++			return -1;
++		}
++
++		initialized = true;
++	} else if (vma->e->pgoff != HISI_SEC_MMIO && vma->e->pgoff != HISI_SEC_DUS) {
++		/* It's impossible value for fd, just as a tag to show it's a
++		 * vma by `mprotect` syscall.
++		 */
++		return LONG_MAX;
++	}
++
++	idx = (vma->e->name[strlen(vma->e->name)-1] - '0') % MAX_HISI_SEC_SIZE;
++	hlist_for_each_entry(desc, &hisi_sec_fds_hash[idx], hash) {
++		if (strcmp(desc->name, vma->e->name) != 0)
++			continue;
++
++		if (vma->e->pgoff == HISI_SEC_MMIO && !desc->mmio) {
++			fd = desc->fd;
++			desc->mmio = true;
++			break;
++		} else if (vma->e->pgoff == HISI_SEC_DUS && !desc->dus) {
++			fd = desc->fd;
++			desc->dus = true;
++			break;
++		}
++	}
++
++	return fd;
++}
++
++static int handle_hisi_vma(struct list_head *fds, struct vma_area *vma)
++{
++	long fd = delivery_hisi_sec_fd(fds, vma);
++
++	if (fd < 0) {
++		pr_err("find fd for char dev vma pgoff %lx named %s failed.\n",
++		       vma->e->pgoff, vma->e->name);
++		return -1;
++	}
++
++	vma->e->fd = fd;
++
+ 	return 0;
+ }
+diff --git a/criu/include/files-chr.h b/criu/include/files-chr.h
+index 5be11f5..26b8fb2 100644
+--- a/criu/include/files-chr.h
++++ b/criu/include/files-chr.h
+@@ -22,4 +22,20 @@ bool find_devname(const char *name);
+ int collect_chr_map(struct pstree_item *me, struct vma_area *vma);
+ int is_infiniband_link(char *link);
+ 
++struct hisi_sec_desc {
++	struct hlist_node hash;
++	char *name;
++	bool mmio;
++	bool dus;
++	int fd;
++};
++
++#define HISI_SEC_DEV	"hisi_sec2"	/* `/dev/hisi_sec2*` char device */
++
++/* here is the selection of offset in `mmap`, they're from drivers */
++enum hisi_sec_dev {
++	HISI_SEC_MMIO	= 0x0,
++	HISI_SEC_DUS	= 0x2000,
++};
++
+ #endif /* __CRIU_FILES_CHR_H__ */
+diff --git a/criu/include/vma.h b/criu/include/vma.h
+index ed9f31e..2b6e86f 100644
+--- a/criu/include/vma.h
++++ b/criu/include/vma.h
+@@ -125,4 +125,16 @@ static inline bool vma_entry_can_be_lazy(VmaEntry *e)
+ 		!(vma_entry_is(e, VMA_AREA_VDSO)) && !(vma_entry_is(e, VMA_AREA_VSYSCALL)));
+ }
+ 
++struct vma_attr {
++	int prot;
++	int flags;
++};
++
++enum ALIEN_MAP_METHOD {
++	PGOFF_IS_ZERO,
++	MAP_THEN_PROTECT,
++
++	MAX_ALIEN_MAP_METHOD,
++};
++
+ #endif /* __CR_VMA_H__ */
+diff --git a/criu/pie/restorer.c b/criu/pie/restorer.c
+index 549bbd6..dcc922e 100644
+--- a/criu/pie/restorer.c
++++ b/criu/pie/restorer.c
+@@ -37,6 +37,7 @@
+ #include "uffd.h"
+ #include "sched.h"
+ #include "notifier.h"
++#include "files-chr.h"
+ 
+ #include "common/lock.h"
+ #include "common/page.h"
+@@ -861,6 +862,129 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
+ 	return addr;
+ }
+ 
++static unsigned long restore_map_then_protect_mapping(VmaEntry *curr,
++						      struct vma_attr *curr_attr,
++						      VmaEntry *next,
++						      struct vma_attr *next_attr)
++{
++	int retval;
++	unsigned long addr;
++
++	if (next->fd != LONG_MAX
++			|| curr->end != next->start
++			|| (vma_entry_len(curr) + curr->pgoff) != next->pgoff
++			|| curr->prot == next->prot
++			|| curr->flags != next->flags) {
++		pr_err("They looks not currect:\n");
++		pr_err("  `- vma A: (%x %x %d %lx)\n",
++				curr_attr->prot, curr_attr->flags,
++				(int)curr->fd, curr->pgoff);
++		pr_err("  `- vma B: (%x %x %d %lx)\n",
++				next_attr->prot, next_attr->flags,
++				(int)next->fd, next->pgoff);
++		return -1;
++	}
++
++	pr_info("\tmmap(%x %x %d %lx) in map then protect mapping\n",
++				curr_attr->prot, curr_attr->flags,
++				(int)curr->fd, curr->pgoff);
++
++	addr = sys_mmap(decode_pointer(curr->start),
++		 vma_entry_len(curr) + vma_entry_len(next),
++		 curr_attr->prot, curr_attr->flags, curr->fd, curr->pgoff);
++	if (addr != curr->start) {
++		pr_err("%s: mmap failed with code %ld\n", __func__, addr);
++		goto out;
++	}
++
++	pr_info("\t  mprotect(%x)\n", next_attr->prot);
++	retval = sys_mprotect(decode_pointer(next->start),
++			      vma_entry_len(next), next_attr->prot);
++	if (retval != 0) {
++		addr = retval;
++		pr_err("%s: mprotect failed with code %d\n", __func__, retval);
++	}
++
++out:
++	return addr;
++}
++
++static unsigned long restore_pgoff_is_zero_mapping(VmaEntry *curr, struct vma_attr *attr)
++{
++	unsigned long addr;
++
++	pr_debug("\tmmap(%x %x %d %lx) in pgoff is zero mapping\n",
++			attr->prot, attr->flags, (int)curr->fd, curr->pgoff);
++
++	addr = sys_mmap(decode_pointer(curr->start),
++			vma_entry_len(curr),
++			attr->prot, attr->flags,
++			curr->fd, curr->pgoff);
++
++	return addr;
++}
++
++static unsigned long restore_hisi_sec_mapping(struct task_restore_args *args,
++						int i, int *step)
++{
++	VmaEntry *curr = args->vmas + i;
++	VmaEntry *next = args->vmas + i + 1;
++	struct vma_attr curr_attr = {
++		.prot = curr->prot,
++		.flags = curr->flags | MAP_FIXED,
++	};
++	struct vma_attr next_attr = {
++		.prot = next->prot,
++		.flags = next->flags | MAP_FIXED,
++	};
++	unsigned long addr;
++
++	switch (curr->pgoff) {
++	case HISI_SEC_MMIO:
++		addr = restore_pgoff_is_zero_mapping(curr, &curr_attr);
++		break;
++	case HISI_SEC_DUS:
++		*step = 2;
++		addr = restore_map_then_protect_mapping(curr, &curr_attr, next, &next_attr);
++		break;
++	default:
++		pr_err("invalid pgoff %lx for vma\n", curr->pgoff);
++		return -1;
++	}
++	return addr;
++}
++
++static bool find(const char *s1, const char *s2)
++{
++	if (s1 == NULL || s2 == NULL)
++		return NULL;
++
++	while (*s1 != '\0' && *s2 != '\0') {
++		if (*s1 == *s2) {
++			s1 += 1;
++			s2 += 1;
++		} else
++			s1 += 1;
++
++		if (*s2 == '\0')
++			return true;
++	}
++
++	return false;
++}
++
++static unsigned long distribute_restore_mapping(struct task_restore_args *args,
++						int i, int *step)
++{
++	VmaEntry *vma = args->vmas + i;
++	struct vma_names *vma_name = args->vma_names + i;
++
++	if (vma_entry_is(vma, VMA_AREA_CHR) && find(vma_name->name, HISI_SEC_DEV))
++		return restore_hisi_sec_mapping(args, i, step);
++	else
++		return restore_mapping(vma);
++}
++
+ /*
+  * This restores aio ring header, content, head and in-kernel position
+  * of tail. To set tail, we write to /dev/null and use the fact this
+@@ -1542,7 +1666,7 @@ int write_fork_pid(int pid)
+ long __export_restore_task(struct task_restore_args *args)
+ {
+ 	long ret = -1;
+-	int i;
++	int i, step;
+ 	VmaEntry *vma_entry;
+ 	unsigned long va;
+ 	struct restore_vma_io *rio;
+@@ -1691,7 +1815,7 @@ long __export_restore_task(struct task_restore_args *args)
+ 	/*
+ 	 * OK, lets try to map new one.
+ 	 */
+-	for (i = 0; i < args->vmas_n; i++) {
++	for (i = 0, step = 1; i < args->vmas_n; i += step, step = 1) {
+ 		vma_entry = args->vmas + i;
+ 		vma_name = args->vma_names + i;
+ 
+@@ -1708,7 +1832,7 @@ long __export_restore_task(struct task_restore_args *args)
+ 		if (vma_entry_is(vma_entry, VMA_PREMMAPED))
+ 			continue;
+ 
+-		va = restore_mapping(vma_entry);
++		va = distribute_restore_mapping(args, i, &step);
+ 
+ 		if (va != vma_entry->start) {
+ 			pr_err("Can't restore %" PRIx64 " mapping with %lx\n", vma_entry->start, va);
+diff --git a/criu/proc_parse.c b/criu/proc_parse.c
+index 8913d93..daa54d9 100644
+--- a/criu/proc_parse.c
++++ b/criu/proc_parse.c
+@@ -41,6 +41,7 @@
+ #include "path.h"
+ #include "fault-injection.h"
+ #include "memfd.h"
++#include "files-chr.h"
+ 
+ #include "protobuf.h"
+ #include "images/fdinfo.pb-c.h"
+@@ -613,7 +614,8 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
+ 			/* NOTICE: if `--dump-char-dev` option is set, permmit
+ 			 * all char device memory area dumping.
+ 			 */
+-			 if (strstr(file_path, "uverbs") != NULL) {
++			 if (strstr(file_path, "uverbs") != NULL
++				|| strstr(file_path, HISI_SEC_DEV) != NULL) {
+ 				int len = strlen(file_path) + 1;
+ 
+ 				vma_area->e->status |= VMA_AREA_CHR;
+-- 
+2.34.1
+

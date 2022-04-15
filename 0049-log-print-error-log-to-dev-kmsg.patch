@@ -1,0 +1,88 @@
+From bec1445fd5dcfffb24918d725163f3be35f8b634 Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Tue, 19 Oct 2021 20:53:19 +0800
+Subject: [PATCH 49/72] log: print error log to /dev/kmsg
+
+The criu log can't be flushed to disk when OS crash in storage
+environment, therefore, output high level msg to /dev/kmsg.
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/Makefile.crtools |  1 +
+ criu/include/log.h    |  3 +++
+ criu/kmsg.c           | 16 ++++++++++++++++
+ criu/log.c            |  4 ++++
+ 4 files changed, 24 insertions(+)
+ create mode 100644 criu/kmsg.c
+
+diff --git a/criu/Makefile.crtools b/criu/Makefile.crtools
+index 7fee749..3bb7c19 100644
+--- a/criu/Makefile.crtools
++++ b/criu/Makefile.crtools
+@@ -96,6 +96,7 @@ obj-y			+= files-chr.o
+ obj-y			+= exit-notify.o
+ obj-y			+= reserved-ports.o
+ obj-y			+= orphan-inode.o
++obj-y			+= kmsg.o
+ obj-$(CONFIG_HAS_LIBBPF)	+= bpfmap.o
+ obj-$(CONFIG_COMPAT)	+= pie-util-vdso-elf32.o
+ CFLAGS_pie-util-vdso-elf32.o	+= -DCONFIG_VDSO_32
+diff --git a/criu/include/log.h b/criu/include/log.h
+index 85e6dc2..aafea95 100644
+--- a/criu/include/log.h
++++ b/criu/include/log.h
+@@ -2,6 +2,7 @@
+ #define __CR_LOG_H__
+ 
+ #include <inttypes.h>
++#include <stddef.h>
+ 
+ #ifndef CR_NOGLIBC
+ 
+@@ -62,4 +63,6 @@ void flush_early_log_buffer(int fd);
+ 
+ #endif /* CR_NOGLIBC */
+ 
++void write_kmsg(const void *buf, size_t count);
++
+ #endif /* __CR_LOG_H__ */
+diff --git a/criu/kmsg.c b/criu/kmsg.c
+new file mode 100644
+index 0000000..c956dfb
+--- /dev/null
++++ b/criu/kmsg.c
+@@ -0,0 +1,16 @@
++#include <fcntl.h>
++#include <unistd.h>
++
++#define SYSLOG_DEV	"/dev/kmsg"
++
++void write_kmsg(const void *buf, size_t count)
++{
++	int fd;
++
++	fd = open(SYSLOG_DEV, O_CLOEXEC | O_WRONLY);
++	if (fd < 0)
++		return;
++
++	write(fd, buf, count);
++	close(fd);
++}
+diff --git a/criu/log.c b/criu/log.c
+index c4ce90e..ba208f7 100644
+--- a/criu/log.c
++++ b/criu/log.c
+@@ -373,6 +373,10 @@ static void vprint_on_level(unsigned int loglevel, const char *format, va_list p
+ 	size += buf_off;
+ 
+ 	while (off < size) {
++		if (loglevel <= LOG_WARN) {
++			write_kmsg(buffer + off, size - off);
++		}
++
+ 		ret = write(fd, buffer + off, size - off);
+ 		if (ret <= 0)
+ 			break;
+-- 
+2.34.1
+

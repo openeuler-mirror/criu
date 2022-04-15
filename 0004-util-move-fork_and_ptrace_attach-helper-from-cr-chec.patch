@@ -1,13 +1,13 @@
-From fe1f84eb98092b1aff60ae2be11e351b165f3f43 Mon Sep 17 00:00:00 2001
+From 30381c725f7c6738bd0df0f822aace1e66065b65 Mon Sep 17 00:00:00 2001
 From: bb-cat <ningyu9@huawei.com>
 Date: Wed, 2 Mar 2022 13:35:53 +0800
-Subject: [PATCH 04/16] util: move fork_and_ptrace_attach helper from cr-check
+Subject: [PATCH 04/72] util: move fork_and_ptrace_attach helper from cr-check
  Signed-off-by: Alexander Mikhalitsyn <alexander.mikhalitsyn@virtuozzo.com>
 
 ---
- criu/cr-check.c     | 55 -------------------------------
+ criu/cr-check.c     | 55 -------------------------------------------
  criu/include/util.h |  1 +
- criu/util.c         | 57 +++++++++++++++++++++++++++++++++
+ criu/util.c         | 57 +++++++++++++++++++++++++++++++++++++++++++++
  3 files changed, 58 insertions(+), 55 deletions(-)
 
 diff --git a/criu/cr-check.c b/criu/cr-check.c
@@ -157,5 +157,5 @@ index 06124c2..e682161 100644
  {
  	char c = 0;
 -- 
-2.30.0
+2.34.1
 

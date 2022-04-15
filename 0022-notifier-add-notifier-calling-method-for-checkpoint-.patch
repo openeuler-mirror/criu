@@ -1,0 +1,621 @@
+From 33c351e18eddc2517f799c1cac20790ebabddbc8 Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Wed, 19 May 2021 21:45:03 +0800
+Subject: [PATCH 22/72] notifier: add notifier calling method for checkpoint
+ and restore
+
+Add notifier calling method for checkpoint and restore during kernel module upgrading.
+
+Signed-off-by: Xiaoguang Li <lixiaoguang2@huawei.com>
+Signed-off-by: He Jingxian <hejingxian@huawei.com>
+Signed-off-by: fu.lin <fu.lin10@huawei.com>
+---
+ criu/config.c             |   1 +
+ criu/cr-dump.c            |  34 +++++++++++
+ criu/cr-restore.c         |  18 +++++-
+ criu/crtools.c            |   2 +
+ criu/include/cr_options.h |   1 +
+ criu/include/notifier.h   |  44 +++++++++++++++
+ criu/include/restorer.h   |   1 +
+ criu/include/util.h       |   2 +
+ criu/pie/restorer.c       | 116 ++++++++++++++++++++++++++++++++++----
+ criu/pie/util.c           |  91 ++++++++++++++++++++++++++++++
+ 10 files changed, 297 insertions(+), 13 deletions(-)
+ create mode 100644 criu/include/notifier.h
+
+diff --git a/criu/config.c b/criu/config.c
+index 6dfbb01..5d1cff6 100644
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -700,6 +700,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		{ "lsm-mount-context", required_argument, 0, 1099 },
+ 		{ "network-lock", required_argument, 0, 1100 },
+ 		BOOL_OPT("use-fork-pid", &opts.use_fork_pid),
++		BOOL_OPT("with-notifier", &opts.with_notifier_kup),
+ 		{},
+ 	};
+ 
+diff --git a/criu/cr-dump.c b/criu/cr-dump.c
+index 5fac9ce..50a2f9b 100644
+--- a/criu/cr-dump.c
++++ b/criu/cr-dump.c
+@@ -87,6 +87,7 @@
+ #include "apparmor.h"
+ #include "asm/dump.h"
+ #include "pin-mem.h"
++#include "notifier.h"
+ 
+ /*
+  * Architectures can overwrite this function to restore register sets that
+@@ -1981,6 +1982,8 @@ static int cr_lazy_mem_dump(void)
+ 	return ret;
+ }
+ 
++static enum notifier_state notifier_state = NOTHING_COMPLETE;
++
+ static int cr_dump_finish(int ret)
+ {
+ 	int post_dump_ret = 0;
+@@ -2067,6 +2070,20 @@ static int cr_dump_finish(int ret)
+ 		clear_pin_mem(0);
+ 	}
+ 
++	if (ret != 0 && opts.with_notifier_kup) {
++		pr_info("call notifier rollback\n");
++		switch (notifier_state) {
++		case PRE_FREEZE_COMPLETE:
++			notifier_kup(PRE_FREEZE, ROLLBACK, true);
++			break;
++		case FREEZE_TO_KILL_COMPLETE:
++			notifier_kup(FREEZE_TO_KILL, ROLLBACK, true);
++			break;
++		default:
++			break;
++		}
++	}
++
+ 	if (ret) {
+ 		pr_err("Dumping FAILED.\n");
+ 	} else {
+@@ -2100,6 +2117,14 @@ int cr_dump_tasks(pid_t pid)
+ 		goto err;
+ 	root_item->pid->real = pid;
+ 
++	if (notifier_kup(PRE_FREEZE, PREPARE, opts.with_notifier_kup)) {
++		/* disable rollback function because we has already rollbacked. */
++		opts.with_notifier_kup = false;
++		pr_err("call notifier: %d err\n", PRE_FREEZE);
++		goto err;
++	} else
++		notifier_state = PRE_FREEZE_COMPLETE;
++
+ 	pre_dump_ret = run_scripts(ACT_PRE_DUMP);
+ 	if (pre_dump_ret != 0) {
+ 		pr_err("Pre dump script failed with %d!\n", pre_dump_ret);
+@@ -2258,6 +2283,15 @@ int cr_dump_tasks(pid_t pid)
+ 	ret = write_img_inventory(&he);
+ 	if (ret)
+ 		goto err;
++
++	ret = notifier_kup(FREEZE_TO_KILL, PREPARE, opts.with_notifier_kup);
++	if (ret) {
++		opts.with_notifier_kup = false;
++		pr_err("call notifier:%d err\n", FREEZE_TO_KILL);
++		goto err;
++	} else
++		notifier_state = FREEZE_TO_KILL_COMPLETE;
++
+ err:
+ 	if (parent_ie)
+ 		inventory_entry__free_unpacked(parent_ie, NULL);
+diff --git a/criu/cr-restore.c b/criu/cr-restore.c
+index 497dd14..03511b6 100644
+--- a/criu/cr-restore.c
++++ b/criu/cr-restore.c
+@@ -81,6 +81,7 @@
+ #include "bpfmap.h"
+ #include "apparmor.h"
+ #include "pin-mem.h"
++#include "notifier.h"
+ 
+ #include "parasite-syscall.h"
+ #include "files-reg.h"
+@@ -1951,6 +1952,7 @@ static int restore_task_with_children(void *_arg)
+ 	return 0;
+ 
+ err:
++	do_notifier_rollback(opts.with_notifier_kup, POST_UPDATE_KERNEL_COMPLETE);
+ 	if (current->parent == NULL)
+ 		futex_abort_and_wake(&task_entries->nr_in_progress);
+ 	exit(1);
+@@ -2451,8 +2453,10 @@ skip_ns_bouncing:
+ 	 */
+ 	attach_to_tasks(root_seized);
+ 
+-	if (restore_switch_stage(CR_STATE_RESTORE_CREDS))
++	if (restore_switch_stage(CR_STATE_RESTORE_CREDS)) {
++		pr_err("Can't switch to CR_STATE_RESTORE_CREDS stage\n");
+ 		goto out_kill_network_unlocked;
++	}
+ 
+ 	timing_stop(TIME_RESTORE);
+ 
+@@ -2631,6 +2635,15 @@ int cr_restore_tasks(void)
+ 		goto clean_cgroup;
+ 
+ 	ret = restore_root_task(root_item);
++	if (ret)
++		goto err;
++
++	ret = notifier_kup(POST_RUN, PREPARE, opts.with_notifier_kup);
++	if (ret < 0) {
++		opts.with_notifier_kup = false;
++		pr_err("calling POST_RUN notifier list return err\n");
++	}
++
+ clean_cgroup:
+ 	fini_cgroup();
+ err:
+@@ -3922,6 +3935,9 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
+ err:
+ 	free_mappings(&self_vmas);
+ err_nv:
++	if (current->parent == NULL && opts.with_notifier_kup)
++		do_notifier_rollback(true, POST_UPDATE_KERNEL_COMPLETE);
++
+ 	/* Just to be sure */
+ 	exit(1);
+ 	return -1;
+diff --git a/criu/crtools.c b/criu/crtools.c
+index 502acdf..1d08620 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -449,6 +449,8 @@ usage:
+ 	       "			same cpu quantity.\n"
+ 	       "  --pin-memory		Use pin memory method for checkpoint and restore.\n"
+ 	       "  --use-fork-pid	Allow to restore task pid by setting fork pid of task struct.\n"
++	       "  --with-notifier	Allow to checkpoint/restore kup notifier chain.\n"
++	       "			This feature needs the kernel assistance.\n"
+ 	       "\n"
+ 	       "Check options:\n"
+ 	       "  Without options, \"criu check\" checks availability of absolutely required\n"
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index 923cc5f..039edba 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -192,6 +192,7 @@ struct cr_options {
+ 	int with_cpu_affinity;
+ 	int pin_memory;
+ 	int use_fork_pid;
++	int with_notifier_kup;
+ };
+ 
+ extern struct cr_options opts;
+diff --git a/criu/include/notifier.h b/criu/include/notifier.h
+new file mode 100644
+index 0000000..e4972a7
+--- /dev/null
++++ b/criu/include/notifier.h
+@@ -0,0 +1,44 @@
++#ifndef __CRIU_NOTIFIER_H__
++#define __CRIU_NOTIFIER_H__
++
++#define NOTIFY_PROC_PATH	"/sys/kernel/modrestore/nvwa_notifier"
++
++#if __has_include("linux/modrestore.h")
++# define CONFIG_EULEROS_MODRESTORE_NOTIFY /* useless, historical factors */
++# include <linux/modrestore.h>
++#else
++enum KUP_HOOK_POINT {
++	PRE_FREEZE,
++	FREEZE_TO_KILL,
++	PRE_UPDATE_KERNEL,
++	POST_UPDATE_KERNEL,
++	UNFREEZE_TO_RUN,
++	POST_RUN,
++
++	KUP_HOOK_MAX,
++};
++
++enum nvwa_cmd {
++       PREPARE = 0,
++       ROLLBACK,
++
++       NVWA_CMD_MAX,
++};
++#endif
++
++enum notifier_state {
++	NOTHING_COMPLETE,
++	PRE_FREEZE_COMPLETE,
++	FREEZE_TO_KILL_COMPLETE,
++	PRE_UPDATE_KERNEL_COMPLETE,
++	POST_UPDATE_KERNEL_COMPLETE,
++	UNFREEZE_TO_RUN_COMPLETE,
++	POST_RUN_COMPLETE,
++
++	NOTIFIER_ROLLBACK_DONE = 0xfc17173b, /* has done rollback */
++};
++
++int notifier_kup(enum KUP_HOOK_POINT, enum nvwa_cmd, bool);
++void do_notifier_rollback(bool, enum notifier_state);
++
++#endif /* __CRIU_NOTIFIER_H__ */
+diff --git a/criu/include/restorer.h b/criu/include/restorer.h
+index 93f87f4..2f7345b 100644
+--- a/criu/include/restorer.h
++++ b/criu/include/restorer.h
+@@ -234,6 +234,7 @@ struct task_restore_args {
+ 	bool has_clone3_set_tid;
+ 	bool pin_memory;
+ 	bool use_fork_pid;
++	bool with_notifier_kup;
+ } __aligned(64);
+ 
+ /*
+diff --git a/criu/include/util.h b/criu/include/util.h
+index 1c0b3c7..e0049a6 100644
+--- a/criu/include/util.h
++++ b/criu/include/util.h
+@@ -13,6 +13,8 @@
+ #include <sys/sysmacros.h>
+ #include <dirent.h>
+ #include <poll.h>
++#include <sys/stat.h>
++#include <fcntl.h>
+ 
+ #include "int.h"
+ #include "common/compiler.h"
+diff --git a/criu/pie/restorer.c b/criu/pie/restorer.c
+index 1317582..4a1d38d 100644
+--- a/criu/pie/restorer.c
++++ b/criu/pie/restorer.c
+@@ -36,6 +36,7 @@
+ #include "vma.h"
+ #include "uffd.h"
+ #include "sched.h"
++#include "notifier.h"
+ 
+ #include "common/lock.h"
+ #include "common/page.h"
+@@ -77,6 +78,7 @@
+ 
+ static struct task_entries *task_entries_local;
+ static futex_t thread_inprogress;
++static futex_t thread_start;
+ static pid_t *helpers;
+ static int n_helpers;
+ static pid_t *zombies;
+@@ -118,10 +120,28 @@ void parasite_cleanup(void)
+ 
+ extern void cr_restore_rt(void) asm("__cr_restore_rt") __attribute__((visibility("hidden")));
+ 
++static int args_with_notifier_kup;
++static enum notifier_state notifier_state = POST_UPDATE_KERNEL_COMPLETE;
++static futex_t notifier_done;
++
+ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
+ {
+ 	char *r;
+ 	int i;
++	rt_sigaction_t act;
++
++	if (signal == SIGSEGV || signal == SIGBUS || signal == SIGILL) {
++		/* Make sure we exit with the right signal at the end. So for instance
++		* the core will be dumped if enabled. */
++		pr_info("recv signal: %d\n", signal);
++		do_notifier_rollback(args_with_notifier_kup, notifier_state);
++		ksigemptyset (&act.rt_sa_mask);
++		act.rt_sa_flags = SA_SIGINFO | SA_RESTART;
++		act.rt_sa_handler = (rt_sighandler_t)SIG_DFL;
++		sys_sigaction(signal, &act, NULL, sizeof(k_rtsigset_t));
++		sys_kill(sys_getpid(),signal);
++		return;
++	}
+ 
+ 	/* We can ignore helpers that die, we expect them to after
+ 	 * CR_STATE_RESTORE is finished. */
+@@ -148,10 +168,14 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
+ 
+ 	pr_info("Task %d %s %d\n", siginfo->si_pid, r, siginfo->si_status);
+ 
++	pr_info("%s: trace do_notifier_rollback\n", __func__);
++	do_notifier_rollback(args_with_notifier_kup, notifier_state);
+ 	futex_abort_and_wake(&task_entries_local->nr_in_progress);
+ 	/* sa_restorer may be unmaped, so we can't go back to userspace*/
+ 	sys_kill(sys_getpid(), SIGSTOP);
+ 	sys_exit_group(1);
++
++	/* for notifier, do nothing when receiving SIGCHLD signal */
+ }
+ 
+ static int lsm_set_label(char *label, char *type, int procfd)
+@@ -616,6 +640,27 @@ static void noinline rst_sigreturn(unsigned long new_sp, struct rt_sigframe *sig
+ 	ARCH_RT_SIGRETURN(new_sp, sigframe);
+ }
+ 
++/* Notice: only one task, so it isn't necessary to consider concurrent. */
++static int do_notifier(bool *notify)
++{
++	int retval = 0;
++
++	if (!*notify)
++		return 0;
++
++	pr_info("unfreeze_to_run restore notifier\n");
++	retval = notifier_kup(UNFREEZE_TO_RUN, PREPARE, true);
++	if (retval) {
++		*notify = false;
++		notifier_state = NOTIFIER_ROLLBACK_DONE;
++		pr_err("call notifier: %d err\n", UNFREEZE_TO_RUN);
++	}
++
++	notifier_state = UNFREEZE_TO_RUN_COMPLETE;
++
++	return retval;
++}
++
+ /*
+  * Threads restoration via sigreturn. Note it's locked
+  * routine and calls for unlock at the end.
+@@ -654,12 +699,18 @@ long __export_restore_thread(struct thread_restore_args *args)
+ 
+ 	pr_info("%ld: Restored\n", sys_gettid());
+ 
+-	restore_finish_stage(task_entries_local, CR_STATE_RESTORE);
++	if (!!(restore_finish_stage(task_entries_local, CR_STATE_RESTORE) & FUTEX_ABORT_FLAG)) {
++		pr_err("%s: abort by CR_STATE_RESTORE\n", __func__);
++		goto core_restore_end;
++	}
+ 
+ 	if (restore_signals(args->siginfo, args->siginfo_n, false))
+ 		goto core_restore_end;
+ 
+-	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD);
++	if (!!(restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD) & FUTEX_ABORT_FLAG)) {
++		pr_err("%s: abort by CR_STATE_RESTORE_SIGCHLD\n", __func__);
++		goto core_restore_end;
++	}
+ 
+ 	/*
+ 	 * Make sure it's before creds, since it's privileged
+@@ -674,16 +725,29 @@ long __export_restore_thread(struct thread_restore_args *args)
+ 	if (ret)
+ 		BUG();
+ 
+-	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS);
++	if (!!(restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS) & FUTEX_ABORT_FLAG)) {
++		pr_err("%s: abort by CR_STATE_RESTORE_CREDS\n", __func__);
++		goto core_restore_end;
++	}
+ 
+ 	futex_dec_and_wake(&thread_inprogress);
++	futex_wait_while(&thread_start, 0);
++	if (!!(futex_get(&thread_start) & FUTEX_ABORT_FLAG)) {
++		pr_err("%s: abort by thread_start\n", __func__);
++		goto wait_notifier;
++	}
+ 
+ 	new_sp = (long)rt_sigframe + RT_SIGFRAME_OFFSET(rt_sigframe);
+ 	rst_sigreturn(new_sp, rt_sigframe);
+ 
+ core_restore_end:
+-	pr_err("Restorer abnormal termination for %ld\n", sys_getpid());
+-	futex_abort_and_wake(&task_entries_local->nr_in_progress);
++	futex_abort_and_wake(&thread_start);
++	futex_abort_and_wake(&task_entries_local->start);
++
++wait_notifier:
++	pr_err("%s: Restorer abnormal termination for %ld\n", __func__, sys_getpid());
++	futex_wait_while(&notifier_done, 0);
++
+ 	sys_exit_group(1);
+ 	return -1;
+ }
+@@ -1465,6 +1529,10 @@ long __export_restore_task(struct task_restore_args *args)
+ 	rt_sigaction_t act;
+ 	bool has_vdso_proxy;
+ 
++	futex_set(&thread_inprogress, 1);
++	futex_set(&thread_start, 0);
++	futex_set(&notifier_done, 0);
++
+ 	bootstrap_start = args->bootstrap_start;
+ 	bootstrap_len = args->bootstrap_len;
+ 
+@@ -1481,6 +1549,7 @@ long __export_restore_task(struct task_restore_args *args)
+ #ifdef ARCH_HAS_LONG_PAGES
+ 	__page_size = args->page_size;
+ #endif
++	args_with_notifier_kup = args->with_notifier_kup;
+ 
+ 	ksigfillset(&act.rt_sa_mask);
+ 	act.rt_sa_handler = sigchld_handler;
+@@ -1895,7 +1964,8 @@ long __export_restore_task(struct task_restore_args *args)
+ 				pr_err("Unable to create a thread: %ld\n", ret);
+ 				mutex_unlock(&task_entries_local->last_pid_mutex);
+ 				goto core_restore_end;
+-			}
++			} else
++				futex_inc(&thread_inprogress);
+ 		}
+ 
+ 		mutex_unlock(&task_entries_local->last_pid_mutex);
+@@ -1919,7 +1989,14 @@ long __export_restore_task(struct task_restore_args *args)
+ 
+ 	pr_info("%ld: Restored\n", sys_getpid());
+ 
+-	restore_finish_stage(task_entries_local, CR_STATE_RESTORE);
++	if (!!(restore_finish_stage(task_entries_local, CR_STATE_RESTORE) & FUTEX_ABORT_FLAG)) {
++		pr_err("%s: abort by CR_STATE_RESTORE\n", __func__);
++		goto core_restore_end;
++	}
++
++	ret = do_notifier(&args->with_notifier_kup);
++	if (ret)
++		goto core_restore_end;
+ 
+ 	if (wait_helpers(args) < 0)
+ 		goto core_restore_end;
+@@ -1965,7 +2042,8 @@ long __export_restore_task(struct task_restore_args *args)
+ 	if (ret)
+ 		goto core_restore_end;
+ 
+-	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD);
++	if (!!(restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD) & FUTEX_ABORT_FLAG))
++		goto core_restore_end;
+ 
+ 	rst_tcp_socks_all(args);
+ 
+@@ -1986,15 +2064,20 @@ long __export_restore_task(struct task_restore_args *args)
+ 	ret = ret || restore_pdeath_sig(args->t);
+ 	ret = ret || restore_child_subreaper(args->child_subreaper);
+ 
+-	futex_set_and_wake(&thread_inprogress, args->nr_threads);
+-
+-	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS);
++	if (!!(restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS) & FUTEX_ABORT_FLAG))
++		goto core_restore_end;
+ 
+ 	if (ret)
+ 		BUG();
+ 
+ 	/* Wait until children stop to use args->task_entries */
+ 	futex_wait_while_gt(&thread_inprogress, 1);
++	if (!!(futex_get(&thread_start) & FUTEX_ABORT_FLAG)) {
++		pr_err("%s: terminate by main thread futex_start\n", __func__);
++		goto handle_notifier;
++	}
++
++	futex_set_and_wake(&thread_start, 1);
+ 
+ 	sys_close(args->proc_fd);
+ 	std_log_set_fd(-1);
+@@ -2030,8 +2113,17 @@ long __export_restore_task(struct task_restore_args *args)
+ 	rst_sigreturn(new_sp, rt_sigframe);
+ 
+ core_restore_end:
+-	futex_abort_and_wake(&task_entries_local->nr_in_progress);
++	futex_abort_and_wake(&thread_start);
++	futex_abort_and_wake(&task_entries_local->start);
++
++handle_notifier:
++	do_notifier_rollback(args->with_notifier_kup, notifier_state);
++
++	futex_abort_and_wake(&task_entries_local->nr_in_progress); /* notifier the criu main process */
+ 	pr_err("Restorer fail %ld\n", sys_getpid());
++
++	futex_set_and_wake(&notifier_done, 1); /* wake all other threads to exit */
++
+ 	sys_exit_group(1);
+ 	return -1;
+ }
+diff --git a/criu/pie/util.c b/criu/pie/util.c
+index e7a5a9f..9871db7 100644
+--- a/criu/pie/util.c
++++ b/criu/pie/util.c
+@@ -11,6 +11,7 @@
+ #include "fcntl.h"
+ #include "log.h"
+ #include "util-pie.h"
++#include "notifier.h"
+ 
+ #ifdef CR_NOGLIBC
+ #include <compel/plugins/std/syscall.h>
+@@ -52,3 +53,93 @@ err_close:
+ 		__sys(close)(fd);
+ 	return -1;
+ }
++
++#define KUP_BUF_SIZE  256
++
++static int int_to_string(unsigned number, char *buf, size_t total) {
++	unsigned remainder, quotient, i, len;
++
++	quotient = number;
++	len = 0;
++	do {
++		quotient /= 10;
++		len += 1;
++	} while (quotient > 0);
++
++	if (len > total - 1)
++		return -1;
++
++	quotient = number;
++	i = 1;
++	do {
++		remainder = quotient % 10;
++		quotient = quotient / 10;
++		buf[len-i] = '0' + remainder;
++		i++;
++	} while (quotient > 0);
++	buf[len] = '\0';
++
++	return len == 0 ? -1 : len;
++}
++
++int notifier_kup(enum KUP_HOOK_POINT action, enum nvwa_cmd cmd, bool enable)
++{
++	int fd, count = 0, retval = 0;
++	char buf[KUP_BUF_SIZE] = {0};
++
++	if (!enable)
++		return 0;
++
++	fd = __sys(open)(NOTIFY_PROC_PATH, O_WRONLY, 0);
++	if (fd == -EACCES) {
++		/* there is no priviledge to open file, ignore this condition. */
++		pr_info("%s: open %s failed, retval: %d (-EACCES)\n",
++				__func__, NOTIFY_PROC_PATH, -EACCES);
++		return 0;
++	} else if (fd < 0) {
++		__pr_perror("%s: Can't open %s: %d\n", __func__, NOTIFY_PROC_PATH, fd);
++		return fd;
++	}
++
++	retval = int_to_string(action, buf, sizeof(buf)-count);
++	if (retval <= 0) {
++		__pr_perror("%s: int_to_string error\n", __func__);
++		goto err_close;
++	}
++
++	buf[retval] = ':';
++	count = retval + 1;
++
++	retval = int_to_string(cmd, buf+count, sizeof(buf)-count);
++	if (retval <= 0) {
++		__pr_perror("%s: int_to_string error\n", __func__);
++		goto err_close;
++	}
++
++	count += retval;
++	retval = __sys(write)(fd, buf, count);
++	if (retval < 0)
++		__pr_perror("%s: Can't write to %s\n", __func__, NOTIFY_PROC_PATH);
++
++err_close:
++	__sys(close)(fd);
++
++	return retval < 0 ? -1 : 0;
++}
++
++void do_notifier_rollback(bool rollback, enum notifier_state status)
++{
++	if (!rollback)
++		return;
++
++	switch (status) {
++	case POST_UPDATE_KERNEL_COMPLETE:
++		notifier_kup(POST_UPDATE_KERNEL, ROLLBACK, true);
++		break;
++	case UNFREEZE_TO_RUN_COMPLETE:
++		notifier_kup(UNFREEZE_TO_RUN, ROLLBACK, true);
++		break;
++	default:
++		break;
++	}
++}
+-- 
+2.34.1
+

@@ -1,7 +1,7 @@
-From d43ad9913c19afa6d80cb8124015d47361152db8 Mon Sep 17 00:00:00 2001
+From 0fdb1cf439c08f6e957e2e7d234a015ef3b84dfc Mon Sep 17 00:00:00 2001
 From: bb-cat <ningyu9@huawei.com>
 Date: Wed, 2 Mar 2022 15:00:43 +0800
-Subject: [PATCH 10/16] clone-noasan: unregister rseq at the thread start for
+Subject: [PATCH 10/72] clone-noasan: unregister rseq at the thread start for
  new glibc Fresh glibc does rseq registration by default during
  start_thread(). [ see
  https://sourceware.org/git/?p=glibc.git;a=commitdiff;h=95e114a0919d844d8fe07839cb6538b7f5ee920e
@@ -18,7 +18,7 @@ https://sourceware.org/git?p=glibc.git;a=commit;h=8dbeb0561eeb876f557ac9eef57219
 
 Signed-off-by: Alexander Mikhalitsyn <alexander.mikhalitsyn@virtuozzo.com>
 ---
- criu/clone-noasan.c | 42 +++++++++++++++++++++++++++++++--
+ criu/clone-noasan.c | 42 ++++++++++++++++++++++++++++++++++++++++--
  1 file changed, 40 insertions(+), 2 deletions(-)
 
 diff --git a/criu/clone-noasan.c b/criu/clone-noasan.c
@@ -98,5 +98,5 @@ index d657ea2..5f8dd1b 100644
  	return pid;
  }
 -- 
-2.30.0
+2.34.1
 

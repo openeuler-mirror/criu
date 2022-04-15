@@ -1,0 +1,60 @@
+From 5421245cf87bac71cbe999f257ba5b3a96c8733b Mon Sep 17 00:00:00 2001
+From: Liu Chao <liuchao173@huawei.com>
+Date: Fri, 9 Jul 2021 07:32:20 +0000
+Subject: [PATCH 39/72] unlock network when restore fails
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/21
+Signed-off-by: fu.lin <fu.lin10@huawei.com>
+---
+ criu/cr-restore.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/criu/cr-restore.c b/criu/cr-restore.c
+index 152bace..d19768d 100644
+--- a/criu/cr-restore.c
++++ b/criu/cr-restore.c
+@@ -115,6 +115,9 @@
+ #endif
+ 
+ struct pstree_item *current;
++#define NETWORK_COLLECTED	0x1
++#define NETWORK_UNLOCK		0x2
++static int network_status = 0;
+ 
+ static int restore_task_with_children(void *);
+ static int sigreturn_restore(pid_t pid, struct task_restore_args *ta, unsigned long alen, CoreEntry *core);
+@@ -249,6 +252,7 @@ static int crtools_prepare_shared(void)
+ 	/* Connections are unlocked from criu */
+ 	if (!files_collected() && collect_image(&inet_sk_cinfo))
+ 		return -1;
++	network_status |= NETWORK_COLLECTED;
+ 
+ 	if (collect_binfmt_misc())
+ 		return -1;
+@@ -2525,6 +2529,7 @@ skip_ns_bouncing:
+ 
+ 	/* Unlock network before disabling repair mode on sockets */
+ 	network_unlock();
++	network_status |= NETWORK_UNLOCK;
+ 
+ 	/*
+ 	 * Stop getting sigchld, after we resume the tasks they
+@@ -2734,6 +2739,14 @@ clean_cgroup:
+ 	fini_cgroup();
+ err:
+ 	cr_plugin_fini(CR_PLUGIN_STAGE__RESTORE, ret);
++	if (ret < 0) {
++		if (!!(network_status & NETWORK_COLLECTED)
++		    && !files_collected() && collect_image(&inet_sk_cinfo))
++			pr_err("collect inet sk cinfo fail\n");
++
++		if (!!(network_status & NETWORK_UNLOCK))
++			network_unlock();
++	}
+ 	return ret;
+ }
+ 
+-- 
+2.34.1
+

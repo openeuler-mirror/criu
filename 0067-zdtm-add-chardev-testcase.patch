@@ -1,0 +1,288 @@
+From c44c68028f22751ef12fac02567008a16e992fea Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Thu, 17 Feb 2022 14:30:03 +0800
+Subject: [PATCH 67/72] zdtm: add chardev testcase
+
+- char dev `ioctl({IOCTL_CMD_NEEDREPAIR, IOCTL_CMD_REPAIR})`
+  checkpoint/restore test
+- anonymous inode checkpoint/restore test
+---
+ test/zdtm/customization/Makefile       |   3 +-
+ test/zdtm/customization/chardev00.c    |  65 +++++++++++
+ test/zdtm/customization/chardev00.desc |   1 +
+ test/zdtm/mod/Makefile                 |   5 +-
+ test/zdtm/mod/anon_inode.c             | 148 +++++++++++++++++++++++++
+ 5 files changed, 220 insertions(+), 2 deletions(-)
+ create mode 100644 test/zdtm/customization/chardev00.c
+ create mode 100644 test/zdtm/customization/chardev00.desc
+ create mode 100644 test/zdtm/mod/anon_inode.c
+
+diff --git a/test/zdtm/customization/Makefile b/test/zdtm/customization/Makefile
+index 93922c7..7d08db3 100644
+--- a/test/zdtm/customization/Makefile
++++ b/test/zdtm/customization/Makefile
+@@ -11,7 +11,8 @@ TST_NOFILE	=	\
+ 		maps05	\
+ 		maps007	\
+ 		maps008	\
+-		notifier00
++		notifier00	\
++		chardev00
+ 
+ TST_FILE	=	\
+ 		maps00	\
+diff --git a/test/zdtm/customization/chardev00.c b/test/zdtm/customization/chardev00.c
+new file mode 100644
+index 0000000..c708699
+--- /dev/null
++++ b/test/zdtm/customization/chardev00.c
+@@ -0,0 +1,65 @@
++#include <stdio.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include "zdtmtst.h"
++
++#define CHARDEV_PATH    "/dev/anon_test"
++
++const char *test_doc="Tests char dev and anonmous inode map checkpoint/restore";
++
++static int check_maps(unsigned long addr)
++{
++    FILE *fp = fopen("/proc/self/maps", "r");
++    char *line = NULL;
++    size_t n = 0;
++    unsigned long start = 0;
++
++    if (fp == NULL) {
++        pr_perror("open self maps failed");
++        return -1;
++    }
++
++    while (getline(&line, &n, fp) != -1) {
++        test_msg("%s", line);
++        sscanf(line, "%lx-", &start);
++        if (start == addr)
++            return 0;
++    }
++
++    return -1;
++}
++
++int main(int argc, char *argv[])
++{
++    int fd, retval = 0;
++    unsigned long addr;
++
++    test_init(argc, argv);
++
++    fd = open(CHARDEV_PATH, O_RDWR);
++    if (fd < 0) {
++        pr_perror("open '%s' failed", CHARDEV_PATH);
++        return -1;
++    }
++
++    retval = ioctl(fd, 0, &addr);
++    if (retval < 0) {
++        pr_perror("create anonymous map failed");
++        retval = -1;
++        goto out;    
++    }
++    test_msg("create anonymous vma start 0x%lx\n", addr);
++
++    test_daemon();
++    test_waitsig();
++
++    retval = check_maps(addr);
++    if (retval == 0)
++        pass();
++    else
++        fail("anonymous inode map don't restore");
++out:
++    return retval;
++}
+diff --git a/test/zdtm/customization/chardev00.desc b/test/zdtm/customization/chardev00.desc
+new file mode 100644
+index 0000000..9c51ba8
+--- /dev/null
++++ b/test/zdtm/customization/chardev00.desc
+@@ -0,0 +1 @@
++{'arch': 'aarch64', 'opts': '--dump-char-dev', 'flavor': 'h', 'flags': 'suid excl', 'sysfs': '/sys/kernel/modrestore/anon_state_restore /sys/kernel/repairing_device', 'mod': 'anon_inode.ko'}
+diff --git a/test/zdtm/mod/Makefile b/test/zdtm/mod/Makefile
+index 10c9c9a..0bc89f7 100644
+--- a/test/zdtm/mod/Makefile
++++ b/test/zdtm/mod/Makefile
+@@ -2,7 +2,7 @@
+ #   `ARCH` var is used in both criu and kernel, but they have the different value
+ #   for the same architecture(e.g. arm64). Therefore, this Makefile can't be
+ #   included in the criu Makefile.
+-obj-m += notifier.o
++obj-m += notifier.o anon_inode.o
+ 
+ # specific the kernel devel path
+ # example (use `/home/me/kernel` as `KDIR`):
+@@ -26,3 +26,6 @@ clean:
+ 
+ notifier.ko:
+ 	$(MAKE) -C $(KDIR) M=$(MOD) notifier.ko
++
++anon_inode.ko:
++	$(MAKE) -C $(KDIR) M=$(MOD) anon_inode.ko
+diff --git a/test/zdtm/mod/anon_inode.c b/test/zdtm/mod/anon_inode.c
+new file mode 100644
+index 0000000..d9c7d2a
+--- /dev/null
++++ b/test/zdtm/mod/anon_inode.c
+@@ -0,0 +1,148 @@
++#define pr_fmt(fmt)	KBUILD_MODNAME	": " fmt
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/miscdevice.h>
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include <linux/mman.h>
++#include <linux/anon_inodes.h>
++#include <linux/file.h>
++#include <linux/modrestore.h>
++
++static int anon_mmap(struct file *file, struct vm_area_struct *vma)
++{
++	pr_info("call %s\n", __func__);
++	return 0;
++}
++
++static const struct file_operations none_fops = {
++	.owner = THIS_MODULE,
++	.mmap = anon_mmap,
++};
++
++static unsigned long create_mmap(void)
++{
++	struct file *filp;
++	unsigned long start;
++
++	pr_info("call %s\n", __func__);
++	filp = anon_inode_getfile("test", &none_fops, NULL, O_RDWR);
++	if (IS_ERR(filp)) {
++		pr_warn("anon_inode_getfile('test') failed: %d\n", (int)PTR_ERR(filp));
++		return PTR_ERR(filp);
++	}
++
++	start = vm_mmap(filp, 0, 1<<20, PROT_READ | PROT_WRITE, MAP_SHARED, 0);
++	if (IS_ERR_VALUE(start)) {
++		pr_warn("vm_mmap failed with: %d\n", (int)PTR_ERR((void *)start));
++	}
++
++	fput(filp);
++
++	return start;
++}
++
++static int anon_inode_notifier(struct notifier_block *nb,
++					unsigned long action, void *data)
++{
++	struct vma_anon_entry *vma_entry = data;
++	struct file *filp;
++	unsigned long start;
++
++	filp = anon_inode_getfile("test", &none_fops, NULL, O_RDWR);
++	if (IS_ERR(filp)) {
++		pr_warn("anon_inode_getfile('test') failed: %d\n", (int)PTR_ERR(filp));
++		return 0;
++	}
++
++	start = vm_mmap(filp, vma_entry->start, vma_entry -> end-vma_entry->start,
++				PROT_READ | PROT_WRITE, MAP_SHARED, 0);
++	if (start != vma_entry->start)
++		pr_warn("vm_mmap() failed: %#lx\n", start);
++
++	fput(filp);
++	return 0;
++}
++
++static long anon_ioctl(struct file *file, unsigned int cmd, unsigned long argp)
++{
++	unsigned long start;
++
++	switch (cmd) {
++		case 0:
++			start = create_mmap();
++			if (IS_ERR_VALUE(start))
++				return -EINVAL;
++            if (put_user(start, (unsigned long __user *)argp))
++                return -EFAULT;
++			break;
++		case IOCTL_CMD_NEEDREPAIR:
++            pr_info("call IOCTL_CMD_NEEDREPAIR");
++            /* do nothing, just a request slot */
++			return 17173;
++		case IOCTL_CMD_REPAIR:
++            pr_info("call IOCTL_CMD_REPAIR");
++			/* do nothing, just a request slot */
++			break;
++		default:
++			pr_warn("wrong cmd\n");
++			return -EINVAL;
++	}
++
++	return 0;
++}
++
++static const struct file_operations anon_fops = {
++	.owner = THIS_MODULE,
++	.unlocked_ioctl = anon_ioctl,
++	.compat_ioctl = anon_ioctl,
++};
++
++static struct miscdevice anon_dev = {
++	.minor  = MISC_DYNAMIC_MINOR,
++	.name = "anon_test",
++	.fops = &anon_fops,
++};
++
++static struct notifier_block anon_inode_nb = {
++	.notifier_call  = anon_inode_notifier,
++};
++
++static int __init anon_init(void)
++{
++	int retval;
++
++	retval = mures_add_devname(anon_dev.name);
++	if (retval != 0)
++		goto out;
++
++	retval = register_anon_notifier(&anon_inode_nb);
++	if (retval != 0)
++		goto del_devname;
++
++	retval = misc_register(&anon_dev);
++	if (retval != 0)
++		goto del_notifier;
++
++	return 0;
++
++del_notifier:
++	unregister_anon_notifier(&anon_inode_nb);
++del_devname:
++	mures_del_devname(anon_dev.name);
++out:
++	return retval;
++}
++
++static void __exit anon_exit(void)
++{
++	mures_del_devname(anon_dev.name);
++	unregister_anon_notifier(&anon_inode_nb);
++	misc_deregister(&anon_dev);
++	return;
++}
++
++module_init(anon_init);
++module_exit(anon_exit);
++MODULE_LICENSE("GPL");
+-- 
+2.34.1
+

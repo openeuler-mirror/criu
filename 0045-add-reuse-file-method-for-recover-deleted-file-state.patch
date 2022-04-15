@@ -1,0 +1,244 @@
+From 1328e32ee05c59f7168039211c9d96176ff22791 Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Sat, 14 Aug 2021 16:45:40 +0800
+Subject: [PATCH 45/72] add reuse file method for recover deleted file state
+
+Orphan inode maybe exist in checkpoint process. Sometimes it can't be
+re-linked by `linkat()` syscall, e.g. sysfs.
+
+Therefore, add reuse file method for recover file state of deleted
+files.
+
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/Makefile.crtools       |  1 +
+ criu/files-reg.c            | 10 ++++--
+ criu/files.c                | 22 +++++++++++-
+ criu/include/orphan-inode.h | 16 +++++++++
+ criu/orphan-inode.c         | 71 +++++++++++++++++++++++++++++++++++++
+ 5 files changed, 116 insertions(+), 4 deletions(-)
+ create mode 100644 criu/include/orphan-inode.h
+ create mode 100644 criu/orphan-inode.c
+
+diff --git a/criu/Makefile.crtools b/criu/Makefile.crtools
+index 3e522b4..7fee749 100644
+--- a/criu/Makefile.crtools
++++ b/criu/Makefile.crtools
+@@ -95,6 +95,7 @@ obj-y			+= devname.o
+ obj-y			+= files-chr.o
+ obj-y			+= exit-notify.o
+ obj-y			+= reserved-ports.o
++obj-y			+= orphan-inode.o
+ obj-$(CONFIG_HAS_LIBBPF)	+= bpfmap.o
+ obj-$(CONFIG_COMPAT)	+= pie-util-vdso-elf32.o
+ CFLAGS_pie-util-vdso-elf32.o	+= -DCONFIG_VDSO_32
+diff --git a/criu/files-reg.c b/criu/files-reg.c
+index 6dc8745..ed46764 100644
+--- a/criu/files-reg.c
++++ b/criu/files-reg.c
+@@ -46,6 +46,7 @@
+ #include "external.h"
+ #include "memfd.h"
+ #include "files-chr.h"
++#include "orphan-inode.h"
+ 
+ #include "protobuf.h"
+ #include "util.h"
+@@ -1260,8 +1261,10 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms,
+ 		 */
+ 
+ 		if (errno == ENOENT) {
+-			link_strip_deleted(link);
+-			return dump_linked_remap(rpath + 1, plen - 1, ost, lfd, id, nsid);
++			pr_info("Start add no exist file: %s\n", rpath+1);
++			add_reuse_file(id, lfd, dst_pid);
++			need_reuse_flag = O_REUSE;
++			return 0;
+ 		}
+ 
+ 		pr_perror("Can't stat path");
+@@ -1663,7 +1666,8 @@ ext:
+ 	rfe.has_mode = true;
+ 	rfe.mode = p->stat.st_mode;
+ 
+-	if (S_ISREG(p->stat.st_mode) && should_check_size(rfe.flags) && !store_validation_data(&rfe, p, lfd))
++	if (S_ISREG(p->stat.st_mode) && should_check_size(rfe.flags)
++	    && (need_reuse_flag != O_REUSE) && !store_validation_data(&rfe, p, lfd))
+ 		return -1;
+ 
+ 	fe.type = FD_TYPES__REG;
+diff --git a/criu/files.c b/criu/files.c
+index 1c52cf4..e79052e 100644
+--- a/criu/files.c
++++ b/criu/files.c
+@@ -50,6 +50,7 @@
+ #include "fdstore.h"
+ #include "bpfmap.h"
+ #include "files-chr.h"
++#include "orphan-inode.h"
+ 
+ #include "protobuf.h"
+ #include "util.h"
+@@ -706,6 +707,7 @@ int dump_my_file(int lfd, u32 *id, int *type)
+ }
+ 
+ int dst_pid;
++int need_reuse_flag;
+ 
+ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, struct parasite_drain_fd *dfds)
+ {
+@@ -743,10 +745,13 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
+ 		for (i = 0; i < nr_fds; i++) {
+ 			FdinfoEntry e = FDINFO_ENTRY__INIT;
+ 
++			need_reuse_flag = 0;
+ 			ret = dump_one_file(item->pid, dfds->fds[i + off], lfds[i], opts + i, ctl, &e, dfds);
+ 			if (ret)
+ 				break;
+ 
++			e.flags |= need_reuse_flag;
++			pr_info("write fdinfoEntry fd=%d id=%d\n", (&e)->fd, (&e)->id);
+ 			ret = pb_write_one(img, &e, PB_FDINFO);
+ 			if (ret)
+ 				break;
+@@ -939,7 +944,8 @@ int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info, bool fake)
+ {
+ 	struct file_desc *fdesc;
+ 
+-	pr_info("Collect fdinfo pid=%d fd=%d id=%#x\n", pid, e->fd, e->id);
++	pr_info("Collect fdinfo pid=%d fd=%d id=%#x flags: %#x\n",
++		pid, e->fd, e->id, e->flags);
+ 
+ 	fdesc = find_file_desc(e);
+ 	if (fdesc == NULL) {
+@@ -1230,6 +1236,7 @@ static int open_fd(struct fdinfo_list_entry *fle)
+ 	int new_fd = -1, ret;
+ 	struct chrfile_info *ci;
+ 
++	pr_info("open file flags: %#x\n", fle->fe->flags);
+ 	flem = file_master(d);
+ 	if (fle != flem) {
+ 		BUG_ON(fle->stage != FLE_INITIALIZED);
+@@ -1251,6 +1258,19 @@ static int open_fd(struct fdinfo_list_entry *fle)
+ 				return 0;
+ 			}
+ 		}
++	} else if (fle->fe->flags & O_REUSE) {
++		pr_info("find reuse file:%d\n", d->id);
++		ret = repair_reuse_file(d->id);
++		if (!ret) {
++			new_fd = get_reuse_file();
++			pr_info("get reuse file:%d\n", new_fd);
++			if (new_fd <= 0 || setup_and_serve_out(fle, new_fd) < 0) {
++				pr_err("setup reuse file fail\n");
++				return -1;
++			}
++			fle->stage = FLE_RESTORED;
++			return 0;
++		}
+ 	}
+ 
+ 	/*
+diff --git a/criu/include/orphan-inode.h b/criu/include/orphan-inode.h
+new file mode 100644
+index 0000000..bc3b6ae
+--- /dev/null
++++ b/criu/include/orphan-inode.h
+@@ -0,0 +1,16 @@
++#ifndef __CRIU_ORPHAN_INODE_H__
++#define __CRIU_ORPHAN_INODE_H__
++
++#define ADD_REUSE_FILE_PATH	"/sys/kernel/add_reuse_file"
++#define REPAIR_REUSE_FILE_PATH	"/sys/kernel/repair_reuse_file"
++#define REUSE_FILE_PATH		"/sys/kernel/reuse_file"
++#define O_REUSE			0100000000
++
++extern int dst_pid;
++extern int need_reuse_flag;
++
++int add_reuse_file(u32 id, int fd, int pid);
++int repair_reuse_file(int id);
++int get_reuse_file(void);
++
++#endif /* __CRIU_ORPHAN_INODE_H__ */
+diff --git a/criu/orphan-inode.c b/criu/orphan-inode.c
+new file mode 100644
+index 0000000..c4e38dc
+--- /dev/null
++++ b/criu/orphan-inode.c
+@@ -0,0 +1,71 @@
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "int.h"
++#include "log.h"
++#include "orphan-inode.h"
++
++int add_reuse_file(u32 id, int fd, int pid)
++{
++	int retval;
++	char buf[256] = {0};
++
++	retval = snprintf(buf, 256, "%u,%d,%d", id, fd, pid);
++	if (retval <= 0)
++		return -EFAULT;
++
++	fd = open(ADD_REUSE_FILE_PATH, O_WRONLY, 0);
++	if (fd < 0) {
++		pr_err("open file:%s fail\n", ADD_REUSE_FILE_PATH);
++		return fd;
++	}
++
++	retval = write(fd, buf, strlen(buf));
++	close(fd);
++
++	return retval < 0 ? -1 : 0;
++}
++
++int repair_reuse_file(int id)
++{
++	int retval, fd;
++	char buf[256] = {0};
++
++	retval = snprintf(buf, 256, "%u", id);
++	if (retval <= 0)
++		return -EFAULT;
++
++	fd = open(REPAIR_REUSE_FILE_PATH, O_WRONLY, 0);
++	if (fd < 0) {
++		pr_err("open file:%s fail\n", REPAIR_REUSE_FILE_PATH);
++		return fd;
++	}
++	retval = write(fd, buf, strlen(buf));
++
++	close(fd);
++	return retval < 0 ? -1 : 0;
++}
++
++int get_reuse_file(void)
++{
++	int fd;
++	ssize_t count;
++	int retval = -1;
++	char buf[32] = {0};
++
++	fd = open(REUSE_FILE_PATH, O_RDONLY , 0);
++	if (fd < 0) {
++		pr_err("open file:%s fail\n", REUSE_FILE_PATH);
++		return fd;
++	}
++
++	count = read(fd, buf, sizeof(buf));
++	if (count > 0)
++		retval = atoi(buf);
++
++	close(fd);
++	return retval;
++}
+-- 
+2.34.1
+

@@ -1,0 +1,99 @@
+From 89eb9deee6da8acc7747e103ee591f299fec2043 Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Wed, 19 May 2021 21:56:38 +0800
+Subject: [PATCH 31/72] criu: eventpollfd fix for improper usage in appdata
+
+Fix eventpollfd problem of improper usage in appdata.
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/21
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+Signed-off-by: fu.lin <fu.lin10@huawei.com>
+---
+ criu/eventpoll.c       | 16 +++++++++++-----
+ criu/proc_parse.c      |  2 ++
+ images/eventpoll.proto |  3 +++
+ 3 files changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/criu/eventpoll.c b/criu/eventpoll.c
+index 978dca5..8900d50 100644
+--- a/criu/eventpoll.c
++++ b/criu/eventpoll.c
+@@ -67,8 +67,8 @@ int is_eventpoll_link(char *link)
+ 
+ static void pr_info_eventpoll_tfd(char *action, uint32_t id, EventpollTfdEntry *e)
+ {
+-	pr_info("%seventpoll-tfd: id %#08x tfd %8d events %#08x data %#016" PRIx64 "\n", action, id, e->tfd, e->events,
+-		e->data);
++	pr_info("%seventpoll-tfd: id %#08x tfd %8d events %#08x data %#016" PRIx64 " ignore %d\n",
++		action, id, e->tfd, e->events, e->data, e->ignore);
+ }
+ 
+ static void pr_info_eventpoll(char *action, EventpollFileEntry *e)
+@@ -144,9 +144,9 @@ int flush_eventpoll_dinfo_queue(void)
+ 			};
+ 			struct kid_elem *t = kid_lookup_epoll_tfd(&fd_tree, &ke, &slot);
+ 			if (!t) {
+-				pr_debug("kid_lookup_epoll: no match pid %d efd %d tfd %d toff %u\n", dinfo->pid,
+-					 dinfo->efd, tfde->tfd, dinfo->toff[i].off);
+-				goto err;
++				pr_info("Drop tfd entry, pid %d efd %d tfd %d toff %u\n",
++					dinfo->pid, dinfo->efd, tfde->tfd, dinfo->toff[i].off);
++				continue;
+ 			}
+ 
+ 			pr_debug("kid_lookup_epoll: rbsearch match pid %d efd %d tfd %d toff %u -> %d\n", dinfo->pid,
+@@ -159,6 +159,7 @@ int flush_eventpoll_dinfo_queue(void)
+ 				goto err;
+ 			}
+ 
++			pr_info("Change tfd: %d -> %d @ efd=%d\n", tfde->tfd, t->idx, slot.efd);
+ 			tfde->tfd = t->idx;
+ 		}
+ 
+@@ -409,6 +410,11 @@ static int eventpoll_retore_tfd(int fd, int id, EventpollTfdEntry *tdefe)
+ {
+ 	struct epoll_event event;
+ 
++	if (tdefe->ignore) {
++		pr_info_eventpoll_tfd("Ignore ", id, tdefe);
++		return 0;
++	}
++
+ 	pr_info_eventpoll_tfd("Restore ", id, tdefe);
+ 
+ 	event.events = tdefe->events;
+diff --git a/criu/proc_parse.c b/criu/proc_parse.c
+index daa54d9..d13589c 100644
+--- a/criu/proc_parse.c
++++ b/criu/proc_parse.c
+@@ -1895,10 +1895,12 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
+ 				e->has_dev = false;
+ 				e->has_inode = false;
+ 				e->has_pos = false;
++				e->has_ignore = false;
+ 			} else if (ret == 6) {
+ 				e->has_dev = true;
+ 				e->has_inode = true;
+ 				e->has_pos = true;
++				e->has_ignore = true;
+ 			} else if (ret < 6) {
+ 				eventpoll_tfd_entry__free_unpacked(e, NULL);
+ 				goto parse_err;
+diff --git a/images/eventpoll.proto b/images/eventpoll.proto
+index 0f3e8a8..2fd9598 100644
+--- a/images/eventpoll.proto
++++ b/images/eventpoll.proto
+@@ -14,6 +14,9 @@ message eventpoll_tfd_entry {
+ 	optional uint32		dev	= 5;
+ 	optional uint64		inode	= 6;
+ 	optional uint64		pos	= 7;
++
++	/* entry validation */
++	optional uint32		ignore	= 8;
+ }
+ 
+ message eventpoll_file_entry {
+-- 
+2.34.1
+

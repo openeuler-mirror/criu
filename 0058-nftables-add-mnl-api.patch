@@ -1,0 +1,283 @@
+From e6dea32c64dfae3a6d06512b45f66416fc974556 Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fu.lin10@huawei.com>
+Date: Wed, 11 Aug 2021 16:50:49 +0800
+Subject: [PATCH 58/72] nftables: add mnl api
+
+libmnl provides the communication between userspace and kernelspace for
+netfilter netlink. I abstract here for the next usage.
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/Makefile           |   2 +
+ criu/Makefile.crtools   |   1 +
+ criu/Makefile.packages  |   6 ++
+ criu/include/nftables.h |  28 +++++++
+ criu/mnl.c              | 165 ++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 202 insertions(+)
+ create mode 100644 criu/include/nftables.h
+ create mode 100644 criu/mnl.c
+
+diff --git a/criu/Makefile b/criu/Makefile
+index 3b4d69f..8d11bd5 100644
+--- a/criu/Makefile
++++ b/criu/Makefile
+@@ -28,6 +28,8 @@ CFLAGS			+= -iquote images
+ CFLAGS			+= -iquote $(ARCH_DIR)/include
+ CFLAGS			+= -iquote .
+ CFLAGS			+= $(shell $(PKG_CONFIG) --cflags libnl-3.0)
++CFLAGS			+= $(shell $(PKG_CONFIG) --cflags libnftnl)
++CFLAGS			+= $(shell $(PKG_CONFIG) --cflags libmnl)
+ CFLAGS			+= $(CONFIG-DEFINES)
+ 
+ ifeq ($(GMON),1)
+diff --git a/criu/Makefile.crtools b/criu/Makefile.crtools
+index 2ad0207..a132810 100644
+--- a/criu/Makefile.crtools
++++ b/criu/Makefile.crtools
+@@ -98,6 +98,7 @@ obj-y			+= reserved-ports.o
+ obj-y			+= orphan-inode.o
+ obj-y			+= kmsg.o
+ obj-y			+= taskqueue.o
++obj-y			+= mnl.o
+ obj-$(CONFIG_HAS_LIBBPF)	+= bpfmap.o
+ obj-$(CONFIG_COMPAT)	+= pie-util-vdso-elf32.o
+ CFLAGS_pie-util-vdso-elf32.o	+= -DCONFIG_VDSO_32
+diff --git a/criu/Makefile.packages b/criu/Makefile.packages
+index 851489b..76e59ca 100644
+--- a/criu/Makefile.packages
++++ b/criu/Makefile.packages
+@@ -7,6 +7,8 @@ REQ-RPM-PKG-NAMES	+= protobuf-python
+ REQ-RPM-PKG-NAMES	+= libnl3-devel
+ REQ-RPM-PKG-NAMES	+= libcap-devel
+ REQ-RPM-PKG-NAMES	+= $(PYTHON)-future
++REQ-RPM-PKG-NAMES	+= libmnl-devel
++REQ-RPM-PKG-NAMES	+= libnftnl-devel
+ 
+ REQ-RPM-PKG-TEST-NAMES  += libaio-devel
+ 
+@@ -18,6 +20,8 @@ REQ-DEB-PKG-NAMES	+= $(PYTHON)-protobuf
+ REQ-DEB-PKG-NAMES	+= $(PYTHON)-future
+ REQ-DEB-PKG-NAMES	+= libnl-3-dev
+ REQ-DEB-PKG-NAMES	+= libcap-dev
++REQ-DEB-PKG-NAMES	+= libmnl-dev
++REQ-DEB-PKG-NAMES	+= libnftnl-dev
+ 
+ REQ-DEB-PKG-TEST-NAMES	+= $(PYTHON)-yaml
+ REQ-DEB-PKG-TEST-NAMES	+= libaio-dev
+@@ -32,6 +36,8 @@ endif
+ 
+ export LIBS		+= -lprotobuf-c -ldl -lnl-3 -lsoccr -Lsoccr/ -lnet
+ export LIBS		+= -lpthread
++export LIBS		+= $(shell $(PKG_CONFIG) --libs libmnl)
++export LIBS		+= $(shell $(PKG_CONFIG) --libs libnftnl)
+ 
+ check-packages-failed:
+ 	$(warning Can not find some of the required libraries)
+diff --git a/criu/include/nftables.h b/criu/include/nftables.h
+new file mode 100644
+index 0000000..0bdab31
+--- /dev/null
++++ b/criu/include/nftables.h
+@@ -0,0 +1,28 @@
++#ifndef __CR_NFTABLES_H__
++#define __CR_NFTABLES_H__
++
++#include <libmnl/libmnl.h>
++
++struct mnl_params {
++	struct mnl_socket *nl;
++	char *buf;
++	struct mnl_nlmsg_batch *batch;
++	uint32_t seq;
++};
++
++typedef struct nlmsghdr * (*buf_func_t)(struct mnl_params *mnl_params, void *args);
++typedef int (*batch_func_t)(struct mnl_params *mnl_params, void *args);
++typedef int (*mnl_func_t)(struct mnl_params *mnl, batch_func_t cb, void *args);
++
++struct mnl_cb_params {
++	pid_t tree_id;
++	bool create;
++	bool ipv6;
++};
++
++int mnl_sendmsg(batch_func_t batch_cb, void *args);
++int mnl_common(mnl_func_t mnl_cb, void *arg1, void *arg2);
++int mnl_batch_send_and_recv(struct mnl_params *mnl_params, batch_func_t cb, void *args, int *result);
++int mnl_buf_send_and_recv(struct mnl_params *mnl_params, buf_func_t cb, void *args, int *result);
++
++#endif /* __CR_NFTABLES_H__ */
+diff --git a/criu/mnl.c b/criu/mnl.c
+new file mode 100644
+index 0000000..3a03202
+--- /dev/null
++++ b/criu/mnl.c
+@@ -0,0 +1,165 @@
++#include <string.h>
++#include <time.h>
++#include <errno.h>
++
++#include <libnftnl/common.h>
++
++#include "nftables.h"
++#include "log.h"
++
++int mnl_common(mnl_func_t mnl_cb, void *arg1, void *arg2)
++{
++	char buf[MNL_SOCKET_BUFFER_SIZE];
++	struct mnl_params mnl = {
++		.seq = time(NULL),
++	};
++	int retval = -1;
++
++	mnl.nl = mnl_socket_open(NETLINK_NETFILTER);
++	if (mnl.nl == NULL) {
++		pr_err("mnl_socket_open failed with %d: %s\n", errno, strerror(errno));
++		return -1;
++	}
++
++	if (mnl_socket_bind(mnl.nl, 0, MNL_SOCKET_AUTOPID) < 0) {
++		pr_err("mnl_socket_bind wailed with %d: %s\n", errno, strerror(errno));
++		goto err_mnl;
++	}
++
++	mnl.buf = buf;
++	mnl.batch = mnl_nlmsg_batch_start(buf, sizeof(buf));
++	if (mnl.batch == NULL)
++		goto err_mnl;
++
++	if (mnl_cb(&mnl, arg1, arg2) < 0)
++		goto err_batch;
++
++	retval = 0;
++
++err_batch:
++	mnl_nlmsg_batch_stop(mnl.batch);
++err_mnl:
++	mnl_socket_close(mnl.nl);
++
++	return retval;
++}
++
++static int mnl_sendmsg_internal(struct mnl_params *mnl, batch_func_t cb, void *args)
++{
++	int retval = -1;
++
++	nftnl_batch_begin(mnl_nlmsg_batch_current(mnl->batch), mnl->seq++);
++	mnl_nlmsg_batch_next(mnl->batch);
++
++	if (cb(mnl, args) < 0)
++		goto err_batch;
++
++	nftnl_batch_end(mnl_nlmsg_batch_current(mnl->batch), mnl->seq++);
++	mnl_nlmsg_batch_next(mnl->batch);
++
++	if (mnl_socket_sendto(mnl->nl, mnl_nlmsg_batch_head(mnl->batch),
++			      mnl_nlmsg_batch_size(mnl->batch)) < 0) {
++		pr_err("%s: mnl_socket_sendto failed with %d: %s\n",
++				__func__, errno, strerror(errno));
++		goto err_batch;
++	}
++
++	retval = 0;
++
++err_batch:
++	return retval;
++}
++
++int mnl_sendmsg(batch_func_t batch_cb, void *args)
++{
++	return mnl_common(mnl_sendmsg_internal, batch_cb, args);
++}
++
++int mnl_batch_send_and_recv(struct mnl_params *mnl_params, batch_func_t cb,
++			    void *args, int *result)
++{
++	struct mnl_socket *nl = mnl_params->nl;
++	struct mnl_nlmsg_batch *batch = mnl_params->batch;
++	uint32_t *seq = &mnl_params->seq;
++	char buf[MNL_SOCKET_BUFFER_SIZE];
++	int retval;
++
++	mnl_nlmsg_batch_reset(batch);
++	nftnl_batch_begin(mnl_nlmsg_batch_current(batch), (*seq)++);
++	mnl_nlmsg_batch_next(batch);
++
++	if (cb(mnl_params, args) < 0)
++		return -1;
++
++	nftnl_batch_end(mnl_nlmsg_batch_current(batch), (*seq)++);
++	mnl_nlmsg_batch_next(batch);
++
++	if (mnl_socket_sendto(nl, mnl_nlmsg_batch_head(batch),
++			      mnl_nlmsg_batch_size(batch)) < 0) {
++		pr_err("%s: mnl_socket_sendto failed with %d: %s\n",
++				__func__, errno, strerror(errno));
++		return -1;
++	}
++
++	/* don't care the netlink retval, and nlmsg hdr flags has no `NLM_F_ACK` */
++	if (result == NULL)
++		return 0;
++
++	retval = mnl_socket_recvfrom(nl, buf, sizeof(buf));
++	while (retval > 0) {
++		retval = mnl_cb_run(buf, retval, 0, mnl_socket_get_portid(nl), NULL, NULL);
++		if (retval <= 0)
++			break;
++		retval = mnl_socket_recvfrom(nl, buf, sizeof(buf));
++	}
++
++	if (retval < 0) {
++		pr_err("%s: mnl batch socket recv errno with %d: %s\n",
++				__func__, errno, strerror(errno));
++		*result = errno;
++		return -1;
++	}
++
++	*result = 0;
++	return 0;
++}
++
++int mnl_buf_send_and_recv(struct mnl_params *mnl_params, buf_func_t cb,
++			  void *args, int *result)
++{
++	struct mnl_socket *nl = mnl_params->nl;
++	char buf[MNL_SOCKET_BUFFER_SIZE];
++	struct nlmsghdr *nlh;
++	int retval = 0;
++
++	if ((nlh = cb(mnl_params, args)) == NULL)
++		return -1;
++
++	if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
++		pr_err("%s: mnl_socket_sendto failed with %d: %s\n",
++				__func__, errno, strerror(errno));
++		return -1;
++	}
++
++	/* don't care the netlink retval, and nlmsg hdr flags has no `NLM_F_ACK` */
++	if (result == NULL)
++		return 0;
++
++	retval = mnl_socket_recvfrom(nl, buf, sizeof(buf));
++	while (retval > 0) {
++		retval = mnl_cb_run(buf, retval, 0, mnl_socket_get_portid(nl), NULL, NULL);
++		if (retval <= 0)
++			break;
++		retval = mnl_socket_recvfrom(nl, buf, sizeof(buf));
++	}
++
++	if (retval < 0) {
++		pr_info("%s: mnl buf socket recv errno with %d: %s\n",
++				__func__, errno, strerror(errno));
++		*result = errno;
++		return -1;
++	}
++
++	*result = 0;
++	return 0;
++}
+-- 
+2.34.1
+

@@ -1,0 +1,107 @@
+From 1cb92fe0a930cf862f8a3ecd9a812d5b2e3aea60 Mon Sep 17 00:00:00 2001
+From: root <root@localhost.localdomain>
+Date: Wed, 8 Sep 2021 08:23:11 +0000
+Subject: [PATCH 47/72] mm: add clear pin mem and init page map option
+
+Add 'clear-pin-mem' option for clearing pin memory data,
+and 'init-page-map' option for initializationing buffer for
+reading page map info.
+
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/crtools.c         | 13 ++++++++++++-
+ criu/include/pin-mem.h |  4 ++++
+ criu/pin-mem.c         | 20 ++++++++++++++++++++
+ 3 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/criu/crtools.c b/criu/crtools.c
+index ae858e8..cc0a18f 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -43,6 +43,7 @@
+ #include "fault-injection.h"
+ #include "proc_parse.h"
+ #include "kerndat.h"
++#include "pin-mem.h"
+ 
+ #include "setproctitle.h"
+ #include "sysctl.h"
+@@ -169,6 +170,14 @@ int main(int argc, char *argv[], char *envp[])
+ 		goto usage;
+ 	}
+ 
++	if (!strcmp(argv[optind], "clear-pin-memory")) {
++		return clear_pin_mem(0);
++	}
++
++	if (!strcmp(argv[optind], "init-pagemap-read")) {
++		return init_pagemap_read(0);
++	}
++
+ 	/* We must not open imgs dir, if service is called */
+ 	if (strcmp(argv[optind], "service")) {
+ 		ret = open_image_dir(opts.imgs_dir, image_dir_mode(argv, optind));
+@@ -320,7 +329,9 @@ usage:
+ 	       "  service        launch service\n"
+ 	       "  dedup          remove duplicates in memory dump\n"
+ 	       "  cpuinfo dump   writes cpu information into image file\n"
+-	       "  cpuinfo check  validates cpu information read from image file\n");
++	       "  cpuinfo check  validates cpu information read from image file\n"
++	       "  clear-pin-memory clear pin memory manage data\n"
++	       "  init-pagemap-read init data buffer for reading page map info\n");
+ 
+ 	if (usage_error) {
+ 		pr_msg("\nTry -h|--help for more info\n");
+diff --git a/criu/include/pin-mem.h b/criu/include/pin-mem.h
+index 2b54996..b28ef3d 100644
+--- a/criu/include/pin-mem.h
++++ b/criu/include/pin-mem.h
+@@ -39,6 +39,9 @@ struct pin_mem_area_set {
+ #define _SET_FORK_PID	8
+ #define SET_FORK_PID		_IOW(PIN_MEM_MAGIC, _SET_FORK_PID, int)
+ 
++#define _INIT_PAGEMAP_READ	5
++#define INIT_PAGEMAP_READ	_IOW(PIN_MEM_MAGIC, _INIT_PAGEMAP_READ, int)
++
+ #endif /* __has_include("linux/pin_memory.h") */
+ 
+ #define PIN_MEM_FILE	"/dev/pinmem"
+@@ -49,5 +52,6 @@ int pin_vmae(VmaEntry *vmae, struct pstree_item *item);
+ int dump_task_special_pages(int pid);
+ int restore_task_special_pages(int pid);
+ int clear_pin_mem(int pid);
++int init_pagemap_read(int para);
+ 
+ #endif /* __CRIU_PIN_MEM_H__ */
+diff --git a/criu/pin-mem.c b/criu/pin-mem.c
+index b18db97..96ca2c5 100644
+--- a/criu/pin-mem.c
++++ b/criu/pin-mem.c
+@@ -144,3 +144,23 @@ int clear_pin_mem(int pid)
+ 	close(fd);
+ 	return ret;
+ }
++
++int init_pagemap_read(int para)
++{
++	int fd, ret;
++
++	fd = open(PIN_MEM_FILE, O_RDWR, 0);
++	if (fd < 0) {
++		pr_warn("error open file: %s\n", PIN_MEM_FILE);
++		return -1;
++	}
++
++	ret = ioctl(fd, INIT_PAGEMAP_READ, (unsigned long) &para);
++	if (ret < 0) {
++		pr_warn("Init pagemap read fail, errno: %s\n", strerror(errno));
++	}
++
++	close(fd);
++	return ret;
++}
++
+-- 
+2.34.1
+

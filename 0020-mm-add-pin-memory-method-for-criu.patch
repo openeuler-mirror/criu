@@ -1,0 +1,453 @@
+From 3858f7e228b15d0e1ce553f530fda4da9aa4efab Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Fri, 23 Apr 2021 21:22:08 +0800
+Subject: [PATCH 20/72] mm: add pin memory method for criu
+
+Add pin memory method for criu to improve memory recover
+speed and avoid user private data saving to files.
+
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/Makefile.crtools     |   1 +
+ criu/config.c             |   1 +
+ criu/cr-dump.c            |   9 +++
+ criu/cr-restore.c         |   2 +
+ criu/crtools.c            |   1 +
+ criu/include/cr_options.h |   1 +
+ criu/include/pin-mem.h    |  49 +++++++++++++
+ criu/include/restorer.h   |   1 +
+ criu/mem.c                |  16 +++++
+ criu/pie/restorer.c       |  26 ++++++-
+ criu/pin-mem.c            | 146 ++++++++++++++++++++++++++++++++++++++
+ criu/seize.c              |   6 ++
+ 12 files changed, 258 insertions(+), 1 deletion(-)
+ create mode 100644 criu/include/pin-mem.h
+ create mode 100644 criu/pin-mem.c
+
+diff --git a/criu/Makefile.crtools b/criu/Makefile.crtools
+index 50a2fa9..98c4135 100644
+--- a/criu/Makefile.crtools
++++ b/criu/Makefile.crtools
+@@ -90,6 +90,7 @@ obj-y			+= servicefd.o
+ obj-y			+= pie-util-vdso.o
+ obj-y			+= vdso.o
+ obj-y			+= timens.o
++obj-y			+= pin-mem.o
+ obj-$(CONFIG_HAS_LIBBPF)	+= bpfmap.o
+ obj-$(CONFIG_COMPAT)	+= pie-util-vdso-elf32.o
+ CFLAGS_pie-util-vdso-elf32.o	+= -DCONFIG_VDSO_32
+diff --git a/criu/config.c b/criu/config.c
+index 71f99c9..53a5cfd 100644
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -696,6 +696,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		{ "pre-dump-mode", required_argument, 0, 1097 },
+ 		{ "file-validation", required_argument, 0, 1098 },
+ 		BOOL_OPT("with-cpu-affinity", &opts.with_cpu_affinity),
++		BOOL_OPT("pin-memory", &opts.pin_memory),
+ 		{ "lsm-mount-context", required_argument, 0, 1099 },
+ 		{ "network-lock", required_argument, 0, 1100 },
+ 		{},
+diff --git a/criu/cr-dump.c b/criu/cr-dump.c
+index 79387fb..5fac9ce 100644
+--- a/criu/cr-dump.c
++++ b/criu/cr-dump.c
+@@ -86,6 +86,7 @@
+ #include "pidfd-store.h"
+ #include "apparmor.h"
+ #include "asm/dump.h"
++#include "pin-mem.h"
+ 
+ /*
+  * Architectures can overwrite this function to restore register sets that
+@@ -2058,6 +2059,14 @@ static int cr_dump_finish(int ret)
+ 	close_service_fd(CR_PROC_FD_OFF);
+ 	close_image_dir();
+ 
++	if (ret == 0 && opts.pin_memory) {
++		pr_info("start restore_task_special_pages\n");
++		restore_task_special_pages(0);
++	} else if (ret != 0 && opts.pin_memory) {
++		pr_info("clear pin mem info\n");
++		clear_pin_mem(0);
++	}
++
+ 	if (ret) {
+ 		pr_err("Dumping FAILED.\n");
+ 	} else {
+diff --git a/criu/cr-restore.c b/criu/cr-restore.c
+index 864140f..5514c29 100644
+--- a/criu/cr-restore.c
++++ b/criu/cr-restore.c
+@@ -3885,6 +3885,8 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
+ 		task_args, task_args->t->pid, task_args->nr_threads, task_args->clone_restore_fn,
+ 		task_args->thread_args);
+ 
++	task_args->pin_memory = opts.pin_memory;
++
+ 	/*
+ 	 * An indirect call to task_restore, note it never returns
+ 	 * and restoring core is extremely destructive.
+diff --git a/criu/crtools.c b/criu/crtools.c
+index b5a36b9..1b90481 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -447,6 +447,7 @@ usage:
+ 	       "			can be 'filesize' or 'buildid' (default).\n"
+ 	       "  --with-cpu-affinity Allow to restore cpu affinity. Only for hosts with\n"
+ 	       "			same cpu quantity.\n"
++	       "  --pin-memory		Use pin memory method for checkpoint and restore.\n"
+ 	       "\n"
+ 	       "Check options:\n"
+ 	       "  Without options, \"criu check\" checks availability of absolutely required\n"
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index 3b50e59..61898fd 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -190,6 +190,7 @@ struct cr_options {
+ 	int file_validation_method;
+ 	/* restore cpu affinity */
+ 	int with_cpu_affinity;
++	int pin_memory;
+ };
+ 
+ extern struct cr_options opts;
+diff --git a/criu/include/pin-mem.h b/criu/include/pin-mem.h
+new file mode 100644
+index 0000000..7e53b12
+--- /dev/null
++++ b/criu/include/pin-mem.h
+@@ -0,0 +1,49 @@
++#ifndef __CRIU_PIN_MEM_H__
++#define __CRIU_PIN_MEM_H__
++
++#include <stdbool.h>
++
++#include "vma.pb-c.h"
++
++#if __has_include("linux/pin_memory.h")
++# include <linux/pin_memory.h>
++#else
++
++#define PIN_MEM_MAGIC		0x59
++#define _SET_PIN_MEM_AREA	1
++#define _CLEAR_PIN_MEM_AREA	2
++#define _REMAP_PIN_MEM_AREA	3
++#define _DUMP_SEPCIAL_PAGES	6
++#define _RETORE_SEPCIAL_PAGES	7
++
++#define SET_PIN_MEM_AREA	_IOW(PIN_MEM_MAGIC, _SET_PIN_MEM_AREA, struct pin_mem_area_set)
++#define CLEAR_PIN_MEM_AREA	_IOW(PIN_MEM_MAGIC, _CLEAR_PIN_MEM_AREA, int)
++#define REMAP_PIN_MEM_AREA	_IOW(PIN_MEM_MAGIC, _REMAP_PIN_MEM_AREA, int)
++#define DUMP_SPECIAL_PAGES	_IOW(PIN_MEM_MAGIC, _DUMP_SEPCIAL_PAGES, int)
++#define RETORE_SPECIAL_PAGES	_IOW(PIN_MEM_MAGIC, _RETORE_SEPCIAL_PAGES, int)
++
++#define MAX_PIN_MEM_AREA_NUM		16
++
++struct _pin_mem_area {
++	unsigned long virt_start;
++	unsigned long virt_end;
++};
++
++struct pin_mem_area_set {
++	unsigned int pid;
++	unsigned int area_num;
++	struct _pin_mem_area mem_area[MAX_PIN_MEM_AREA_NUM];
++};
++
++#endif /* __has_include("linux/pin_memory.h") */
++
++#define PIN_MEM_FILE	"/dev/pinmem"
++#define ONCE_PIN_MEM_SIZE_LIMIT		(32 * 1024 * 1024)
++
++bool should_pin_vmae(VmaEntry *vmae);
++int pin_vmae(VmaEntry *vmae, struct pstree_item *item);
++int dump_task_special_pages(int pid);
++int restore_task_special_pages(int pid);
++int clear_pin_mem(int pid);
++
++#endif /* __CRIU_PIN_MEM_H__ */
+diff --git a/criu/include/restorer.h b/criu/include/restorer.h
+index c29d869..e0bdc04 100644
+--- a/criu/include/restorer.h
++++ b/criu/include/restorer.h
+@@ -232,6 +232,7 @@ struct task_restore_args {
+ 	int lsm_type;
+ 	int child_subreaper;
+ 	bool has_clone3_set_tid;
++	bool pin_memory;
+ } __aligned(64);
+ 
+ /*
+diff --git a/criu/mem.c b/criu/mem.c
+index ca74bfb..07efdbe 100644
+--- a/criu/mem.c
++++ b/criu/mem.c
+@@ -31,6 +31,7 @@
+ #include "prctl.h"
+ #include "compel/infect-util.h"
+ #include "pidfd-store.h"
++#include "pin-mem.h"
+ 
+ #include "protobuf.h"
+ #include "images/pagemap.pb-c.h"
+@@ -500,6 +501,17 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
+ 			goto out_xfer;
+ 	}
+ 
++	if (opts.pin_memory) {
++		/* pin memory before dump pages */
++		list_for_each_entry(vma_area, &vma_area_list->h, list) {
++			if (should_pin_vmae(vma_area->e)
++					&& pin_vmae(vma_area->e, item) != 0) {
++				exit_code = -1;
++				goto out_xfer;
++			}
++		}
++	}
++
+ 	/*
+ 	 * Step 1 -- generate the pagemap
+ 	 */
+@@ -509,6 +521,10 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
+ 		parent_predump_mode = mdc->parent_ie->pre_dump_mode;
+ 
+ 	list_for_each_entry(vma_area, &vma_area_list->h, list) {
++		if (opts.pin_memory && should_pin_vmae(vma_area->e)) {
++			continue;
++		}
++
+ 		ret = generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
+ 					parent_predump_mode);
+ 		if (ret < 0)
+diff --git a/criu/pie/restorer.c b/criu/pie/restorer.c
+index 368b5a0..db01ba5 100644
+--- a/criu/pie/restorer.c
++++ b/criu/pie/restorer.c
+@@ -49,6 +49,7 @@
+ 
+ #include "shmem.h"
+ #include "restorer.h"
++#include "pin-mem.h"
+ 
+ #ifndef PR_SET_PDEATHSIG
+ #define PR_SET_PDEATHSIG 1
+@@ -1408,6 +1409,24 @@ int cleanup_current_inotify_events(struct task_restore_args *task_args)
+ 	return 0;
+ }
+ 
++int remap_vmas(int pid)
++{
++	int fd, ret = 0;
++
++	fd = sys_open(PIN_MEM_FILE, O_RDWR, 0);
++	if (fd == -1) {
++		pr_err("open file: %s fail.\n", PIN_MEM_FILE);
++		return -1;;
++	}
++
++	ret = sys_ioctl(fd, REMAP_PIN_MEM_AREA, (unsigned long) &pid);
++	if (ret < 0)
++		pr_err("remap pin mem fail for pid: %d\n", pid);
++	sys_close(fd);
++	return ret;
++}
++
++
+ /*
+  * The main routine to restore task via sigreturn.
+  * This one is very special, we never return there
+@@ -1577,7 +1596,12 @@ long __export_restore_task(struct task_restore_args *args)
+ 			goto core_restore_end;
+ 		}
+ 	}
+-
++	if (args->pin_memory) {
++		if (remap_vmas(my_pid) < 0) {
++			pr_err("Remap vmas fail\n");
++			goto core_restore_end;
++		}
++	}
+ 	/*
+ 	 * Now read the contents (if any)
+ 	 */
+diff --git a/criu/pin-mem.c b/criu/pin-mem.c
+new file mode 100644
+index 0000000..b18db97
+--- /dev/null
++++ b/criu/pin-mem.c
+@@ -0,0 +1,146 @@
++#include <fcntl.h>
++#include <stdbool.h>
++#include <sys/ioctl.h>
++
++#include "pstree.h"
++#include "mem.h"
++#include "vma.h"
++#include "pin-mem.h"
++
++bool should_pin_vmae(VmaEntry *vmae)
++{
++	/*
++	 * vDSO area must be always dumped because on restore
++	 * we might need to generate a proxy.
++	 */
++	if (vma_entry_is(vmae, VMA_AREA_VDSO))
++		return false;
++	/*
++	 * In turn VVAR area is special and referenced from
++	 * vDSO area by IP addressing (at least on x86) thus
++	 * never ever dump its content but always use one provided
++	 * by the kernel on restore, ie runtime VVAR area must
++	 * be remapped into proper place..
++	 */
++	if (vma_entry_is(vmae, VMA_AREA_VVAR))
++		return false;
++
++	if (vma_entry_is(vmae, VMA_AREA_AIORING))
++		return false;
++	if (vma_entry_is(vmae, VMA_ANON_PRIVATE))
++		return true;
++
++	return false;
++}
++
++static int pin_one_pmas(int fd, unsigned long start,
++			unsigned long *pend, struct pstree_item *item)
++{
++	int ret;
++	unsigned int index = 0;
++	unsigned long end;
++	unsigned long next = start;
++	struct pin_mem_area_set pmas;
++	struct _pin_mem_area *pma;
++
++	end = *pend;
++	while (start < end) {
++		next = (start + ONCE_PIN_MEM_SIZE_LIMIT > end)
++			? end : (start + ONCE_PIN_MEM_SIZE_LIMIT);
++		pma = &(pmas.mem_area[index]);
++		pma->virt_start = start;
++		pma->virt_end = next;
++		index++;
++		start += ONCE_PIN_MEM_SIZE_LIMIT;
++		if (index >= MAX_PIN_MEM_AREA_NUM)
++			break;
++	}
++
++	*pend = next;
++	pmas.area_num = index;
++	pmas.pid = vpid(item);
++
++	ret = ioctl(fd, SET_PIN_MEM_AREA, &pmas);
++	if (ret < 0)
++		pr_err("pin mem fail, errno: %s\n", strerror(errno));
++	return ret;
++}
++
++int pin_vmae(VmaEntry *vmae, struct pstree_item *item)
++{
++	int fd;
++	int ret = 0;
++	unsigned long start, end;
++
++	fd = open(PIN_MEM_FILE, O_RDWR);
++	if (fd < 0) {
++		pr_err("open file: %s fail.\n", PIN_MEM_FILE);
++		return -1;
++	}
++
++	start = vmae->start;
++	while (start < vmae->end) {
++		end = vmae->end;
++		ret = pin_one_pmas(fd, start, &end, item);
++		if (ret < 0)
++			break;
++		start = end;
++	}
++	close(fd);
++	return ret;
++}
++
++int dump_task_special_pages(int pid)
++{
++	int fd, ret;
++
++	fd = open(PIN_MEM_FILE, O_RDWR, 0);
++	if (fd < 0) {
++		pr_warn("error open file: %s\n", PIN_MEM_FILE);
++		return -1;
++	}
++
++	ret = ioctl(fd, DUMP_SPECIAL_PAGES, (unsigned long) &pid);
++	if (ret < 0)
++		pr_warn("No need DUMP_SPECIAL_PAGES for %d\n", pid);
++
++	close(fd);
++	return ret;
++}
++
++int restore_task_special_pages(int pid)
++{
++	int fd, ret;
++
++	fd = open(PIN_MEM_FILE, O_RDWR, 0);
++	if (fd < 0) {
++		pr_warn("error open file: %s\n", PIN_MEM_FILE);
++		return -1;
++	}
++
++	ret = ioctl(fd, RETORE_SPECIAL_PAGES, (unsigned long) &pid);
++	if (ret < 0)
++		pr_warn("No need RETORE_SPECIAL_PAGES for %d\n", pid);
++
++	close(fd);
++	return ret;
++}
++
++int clear_pin_mem(int pid)
++{
++	int fd, ret;
++
++	fd = open(PIN_MEM_FILE, O_RDWR, 0);
++	if (fd < 0) {
++		pr_warn("error open file: %s\n", PIN_MEM_FILE);
++		return -1;
++	}
++
++	ret = ioctl(fd, CLEAR_PIN_MEM_AREA, (unsigned long) &pid);
++	if (ret < 0) {
++		pr_warn("clear pin mem fail: %d\n", pid);
++	}
++
++	close(fd);
++	return ret;
++}
+diff --git a/criu/seize.c b/criu/seize.c
+index 95bf9ef..8a35c3c 100644
+--- a/criu/seize.c
++++ b/criu/seize.c
+@@ -23,6 +23,7 @@
+ #include "string.h"
+ #include "xmalloc.h"
+ #include "util.h"
++#include "pin-mem.h"
+ 
+ #define NR_ATTEMPTS 5
+ 
+@@ -640,6 +641,11 @@ static void unseize_task_and_threads(const struct pstree_item *item, int st)
+ 	if (item->pid->state == TASK_DEAD)
+ 		return;
+ 
++	if (opts.pin_memory) {
++		for (i = 0; i < item->nr_threads; i++)
++			dump_task_special_pages(item->threads[i].real);
++	}
++
+ 	/*
+ 	 * The st is the state we want to switch tasks into,
+ 	 * the item->state is the state task was in when we seized one.
+-- 
+2.34.1
+

@@ -1,7 +1,7 @@
-From e444c089ebfb03fb2b6d69a40322d31ab33c0597 Mon Sep 17 00:00:00 2001
+From c905adf3aaa116984e28a51700c53917f3651e3b Mon Sep 17 00:00:00 2001
 From: bb-cat <ningyu9@huawei.com>
 Date: Wed, 2 Mar 2022 14:52:35 +0800
-Subject: [PATCH 06/16] rseq: initial support TODO: 1. properly handle case
+Subject: [PATCH 06/72] rseq: initial support TODO: 1. properly handle case
  when the kernel has rseq() support but has no
  ptrace(PTRACE_GET_RSEQ_CONFIGURATION) support and user processes haven't used
  rseq(). 2. properly handle "transient" states, when CRIU comes during rseq
@@ -14,19 +14,19 @@ Reported-by: Radostin Stoyanov <radostin@redhat.com>
 Suggested-by: Florian Weimer <fweimer@redhat.com>
 Signed-off-by: Alexander Mikhalitsyn <alexander.mikhalitsyn@virtuozzo.com>
 ---
- compel/include/uapi/ptrace.h |  16 +--
- criu/cr-dump.c               |  99 ++++++++++++++++
- criu/cr-restore.c            |  17 +++
- criu/include/linux/rseq.h    | 144 +++++++++++++++++++++++
+ compel/include/uapi/ptrace.h |  16 ++--
+ criu/cr-dump.c               |  99 ++++++++++++++++++++++++
+ criu/cr-restore.c            |  17 +++++
+ criu/include/linux/rseq.h    | 144 +++++++++++++++++++++++++++++++++++
  criu/include/parasite.h      |   7 ++
  criu/include/restorer.h      |   7 ++
  criu/kerndat.c               |   2 +-
- criu/parasite-syscall.c      |  11 ++
- criu/pie/parasite.c          |  99 ++++++++++++++++
- criu/pie/restorer.c          |  24 ++++
+ criu/parasite-syscall.c      |  11 +++
+ criu/pie/parasite.c          |  99 ++++++++++++++++++++++++
+ criu/pie/restorer.c          |  24 ++++++
  images/Makefile              |   1 +
  images/core.proto            |   2 +
- images/rseq.proto            |   9 ++
+ images/rseq.proto            |   9 +++
  13 files changed, 429 insertions(+), 9 deletions(-)
  create mode 100644 criu/include/linux/rseq.h
  create mode 100644 images/rseq.proto
@@ -698,5 +698,5 @@ index 0000000..be28004
 +	required uint32 signature		= 3;
 +}
 -- 
-2.30.0
+2.34.1
 

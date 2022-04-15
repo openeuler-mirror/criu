@@ -1,0 +1,62 @@
+From 48c6f11d0b3c5f0549ff52cce0c8ce31ad67518f Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Wed, 19 May 2021 21:49:15 +0800
+Subject: [PATCH 23/72] block-device: dump block device as reguler file
+
+Add block device dump and restore method for kernel module upgrading.
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/21
+Signed-off-by: Xiaoguang Li <lixiaoguang2@huawei.com>
+---
+ criu/files.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/criu/files.c b/criu/files.c
+index 93754fb..f262d80 100644
+--- a/criu/files.c
++++ b/criu/files.c
+@@ -442,6 +442,30 @@ static const struct fdtype_ops *get_mem_dev_ops(struct fd_parms *p, int minor)
+ 	return ops;
+ }
+ 
++static int dump_blkdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
++{
++	struct fd_link *link_old = p->link;
++	int maj = major(p->stat.st_rdev);
++	const struct fdtype_ops *ops;
++	int err;
++
++	switch (maj) {
++	case SCSI_DISK0_MAJOR:
++		ops = &regfile_dump_ops;
++		break;
++	default: {
++		char more[32] = "block_dev";
++
++		err = dump_unsupp_fd(p, lfd, "blk", more, e);
++		p->link = link_old;
++		return err;
++	}
++	}
++	err = do_dump_gen_file(p, lfd, ops, e);
++	p->link = link_old;
++	return err;
++}
++
+ static int dump_chrdev(struct fd_parms *p, int lfd, FdinfoEntry *e)
+ {
+ 	struct fd_link *link_old = p->link;
+@@ -508,6 +532,9 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
+ 	p.fd_ctl = ctl; /* Some dump_opts require this to talk to parasite */
+ 	p.dfds = dfds; /* epoll needs to verify if target fd exist */
+ 
++	if (S_ISBLK(p.stat.st_mode))
++		return dump_blkdev(&p, lfd, e);
++
+ 	if (S_ISSOCK(p.stat.st_mode))
+ 		return dump_socket(&p, lfd, e);
+ 
+-- 
+2.34.1
+

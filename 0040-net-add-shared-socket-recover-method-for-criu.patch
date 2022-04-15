@@ -1,0 +1,332 @@
+From a22542173083d2eeb5dde627c47452ea641c98c1 Mon Sep 17 00:00:00 2001
+From: Sang Yan <sangyan@huawei.com>
+Date: Mon, 12 Jul 2021 16:14:45 +0800
+Subject: [PATCH 40/72] net: add shared socket recover method for criu
+
+When the socket file is shared with another process,
+it will not be freed during dumping process.
+We can repair the socket file by installing it to
+the old fd number.
+
+Add new options: "--share-dst-ports" and "--share-src-ports"
+for user to tell criu which socket ports are shared.
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/21
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+---
+ criu/config.c             |   8 ++
+ criu/crtools.c            |   3 +
+ criu/files.c              |  18 ++++-
+ criu/include/cr_options.h |   2 +
+ criu/include/files.h      |   4 +
+ criu/include/net.h        |   1 +
+ criu/include/sk-inet.h    |   3 +
+ criu/sk-inet.c            | 151 ++++++++++++++++++++++++++++++++++++++
+ 8 files changed, 189 insertions(+), 1 deletion(-)
+
+diff --git a/criu/config.c b/criu/config.c
+index 0a0623a..7e92731 100644
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -706,6 +706,8 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		BOOL_OPT("mask-exit-notify", &opts.mask_exit_notify),
+ 		BOOL_OPT("weak-file-check", &opts.weak_file_check),
+ 		BOOL_OPT("file-locks-repair", &opts.file_locks_repair),
++		{ "share-dst-ports", required_argument, 0, 2000 },
++		{ "share-src-ports", required_argument, 0, 2001 },
+ 		{},
+ 	};
+ 
+@@ -1041,6 +1043,12 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 				return 1;
+ 			}
+ 			break;
++		case 2000:
++			SET_CHAR_OPTS(share_dst_ports, optarg);
++			break;
++		case 2001:
++			SET_CHAR_OPTS(share_src_ports, optarg);
++			break;
+ 		case 'V':
+ 			pr_msg("Version: %s\n", CRIU_VERSION);
+ 			if (strcmp(CRIU_GITID, "0"))
+diff --git a/criu/crtools.c b/criu/crtools.c
+index 7358918..cfa149a 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -104,6 +104,9 @@ int main(int argc, char *argv[], char *envp[])
+ 		goto usage;
+ 	}
+ 
++	if (parse_share_ports())
++		goto usage;
++
+ 	log_set_loglevel(opts.log_level);
+ 
+ 	if (optind < argc && !strcmp(argv[optind], "swrk")) {
+diff --git a/criu/files.c b/criu/files.c
+index 1ec5281..1c52cf4 100644
+--- a/criu/files.c
++++ b/criu/files.c
+@@ -705,6 +705,8 @@ int dump_my_file(int lfd, u32 *id, int *type)
+ 	return 0;
+ }
+ 
++int dst_pid;
++
+ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, struct parasite_drain_fd *dfds)
+ {
+ 	int *lfds = NULL;
+@@ -728,7 +730,7 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
+ 	img = open_image(CR_FD_FDINFO, O_DUMP, item->ids->files_id);
+ 	if (!img)
+ 		goto err;
+-
++	dst_pid = item->pid->real;
+ 	ret = 0; /* Don't fail if nr_fds == 0 */
+ 	for (off = 0; ret == 0 && off < dfds->nr_fds; off += nr_fds) {
+ 		if (nr_fds + off > dfds->nr_fds)
+@@ -1237,6 +1239,20 @@ static int open_fd(struct fdinfo_list_entry *fle)
+ 		goto out;
+ 	}
+ 
++	if (d->ops->type == FD_TYPES__INETSK) {
++		if (check_need_repair(d)) {
++			ret = repair_share_socket(d->id);
++			if (!ret) {
++				new_fd = get_share_socket();
++				pr_info("get share socket:%d\n", new_fd);
++				if (new_fd <= 0 || setup_and_serve_out(fle, new_fd) < 0)
++					return -1;
++				fle->stage = FLE_RESTORED;
++				return 0;
++			}
++		}
++	}
++
+ 	/*
+ 	 * Open method returns the following values:
+ 	 * 0  -- restore is successfully finished;
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index 9ec8034..b7c1e34 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -198,6 +198,8 @@ struct cr_options {
+ 	int mask_exit_notify;
+ 	int weak_file_check;
+ 	int file_locks_repair;
++	char *share_dst_ports;
++	char *share_src_ports;
+ };
+ 
+ extern struct cr_options opts;
+diff --git a/criu/include/files.h b/criu/include/files.h
+index 1d979a9..0521c7e 100644
+--- a/criu/include/files.h
++++ b/criu/include/files.h
+@@ -201,4 +201,8 @@ extern int open_transport_socket(void);
+ extern int set_fds_event(pid_t virt);
+ extern void wait_fds_event(void);
+ 
++extern int repair_share_socket(int id);
++extern int check_need_repair(struct file_desc *d);
++extern int get_share_socket(void);
++
+ #endif /* __CR_FILES_H__ */
+diff --git a/criu/include/net.h b/criu/include/net.h
+index 718cc45..ec47b61 100644
+--- a/criu/include/net.h
++++ b/criu/include/net.h
+@@ -16,6 +16,7 @@ extern int dump_net_ns(struct ns_id *ns);
+ extern int prepare_net_namespaces(void);
+ extern void fini_net_namespaces(void);
+ extern int netns_keep_nsfd(void);
++extern int parse_share_ports(void);
+ 
+ struct pstree_item;
+ extern int restore_task_net_ns(struct pstree_item *current);
+diff --git a/criu/include/sk-inet.h b/criu/include/sk-inet.h
+index c832d63..27deceb 100644
+--- a/criu/include/sk-inet.h
++++ b/criu/include/sk-inet.h
+@@ -101,4 +101,7 @@ struct rst_tcp_sock {
+ union libsoccr_addr;
+ int restore_sockaddr(union libsoccr_addr *sa, int family, u32 pb_port, u32 *pb_addr, u32 ifindex);
+ 
++#define MAX_SHARE_PORT_NUM	64
++extern int dst_pid;
++
+ #endif /* __CR_SK_INET_H__ */
+diff --git a/criu/sk-inet.c b/criu/sk-inet.c
+index 05048c8..c7de793 100644
+--- a/criu/sk-inet.c
++++ b/criu/sk-inet.c
+@@ -431,6 +431,152 @@ static bool needs_scope_id(uint32_t *src_addr)
+ 	return false;
+ }
+ 
++#define ADD_SHARE_SOCKET_PATH  "/sys/kernel/add_share_socket"
++#define REPAIR_SHARE_SOCKET_PATH  "/sys/kernel/repair_share_socket"
++#define SHARE_SOCKET_PATH   "/sys/kernel/share_socket"
++
++int add_share_socket(u32 id, int fd, int pid, int port)
++{
++	int retval;
++	char buf[256] = {0};
++
++	retval = snprintf(buf, 256, "%u,%d,%d,%d", id, fd, pid, port);
++	if (retval <= 0)
++		return -EFAULT;
++
++	fd = open(ADD_SHARE_SOCKET_PATH, O_WRONLY, 0);
++	if (fd < 0) {
++		pr_err("open file:%s fail\n", ADD_SHARE_SOCKET_PATH);
++		return fd;
++	}
++
++	retval = write(fd, buf, strlen(buf));
++	close(fd);
++	return retval < 0 ? -1 : 0;
++}
++
++
++int repair_share_socket(int id)
++{
++	int retval, fd;
++	char buf[256] = {0};
++
++	retval = snprintf(buf, 256, "%u", id);
++	if (retval <= 0)
++		return -EFAULT;
++
++	fd = open(REPAIR_SHARE_SOCKET_PATH, O_WRONLY, 0);
++	if (fd < 0) {
++		pr_err("open file:%s fail\n", REPAIR_SHARE_SOCKET_PATH);
++		return fd;
++	}
++	retval = write(fd, buf, strlen(buf));
++
++	close(fd);
++	return retval < 0 ? -1 : 0;
++}
++
++int get_share_socket(void)
++{
++	int fd;
++	ssize_t count;
++	int retval = -1;
++	char buf[32] = {0};
++
++	fd = open(SHARE_SOCKET_PATH, O_RDONLY, 0);
++	if (fd < 0) {
++		pr_err("open file:%s fail\n", SHARE_SOCKET_PATH);
++		return fd;
++	}
++
++	count = read(fd, buf, sizeof(buf));
++	if (count > 0)
++		retval = atoi(buf);
++
++	close(fd);
++	return retval;
++}
++
++int g_share_dst_ports[MAX_SHARE_PORT_NUM];
++int g_share_dst_port_num;
++int g_share_src_ports[MAX_SHARE_PORT_NUM];
++int g_share_src_port_num;
++
++int parse_share_ports(void)
++{
++	char *save, *p;
++
++	if (opts.share_dst_ports) {
++		p = strtok_r(opts.share_dst_ports, ",", &save);
++		while (p != NULL) {
++			if (g_share_dst_port_num >= MAX_SHARE_PORT_NUM)
++				return -1;
++			g_share_dst_ports[g_share_dst_port_num] = atoi(p);
++			if (!g_share_dst_ports[g_share_dst_port_num])
++				return -1;
++			g_share_dst_port_num++;
++			p = strtok_r(NULL, ",", &save);
++		}
++	}
++
++	if (opts.share_src_ports) {
++		p = strtok_r(opts.share_src_ports, ",", &save);
++		while (p != NULL) {
++			if (g_share_src_port_num >= MAX_SHARE_PORT_NUM)
++				return -1;
++			g_share_src_ports[g_share_src_port_num] = atoi(p);
++			if (!g_share_src_ports[g_share_src_port_num])
++				return -1;
++			g_share_src_port_num++;
++			p = strtok_r(NULL, ",", &save);
++		}
++	}
++	return 0;
++}
++
++int check_share_dst_port(int dst_port)
++{
++	int i;
++	int ret = 0;
++
++	for (i = 0; i < g_share_dst_port_num; i++) {
++		if (dst_port == g_share_dst_ports[i]) {
++			ret = 1;
++			break;
++		}
++	}
++	return ret;
++}
++
++int check_share_src_port(int src_port)
++{
++	int i;
++	int ret = 0;
++
++	for (i = 0; i < g_share_src_port_num; i++) {
++		if (src_port == g_share_src_ports[i]) {
++			ret = 1;
++			break;
++		}
++	}
++
++	return ret;
++}
++
++int check_need_repair(struct file_desc *d)
++{
++	struct inet_sk_info *ii;
++	InetSkEntry *ie;
++
++	ii = container_of(d, struct inet_sk_info, d);
++	ie = ii->ie;
++	if (check_share_dst_port(ie->dst_port) ||
++		check_share_src_port(ie->src_port))
++		return 1;
++	else
++		return 0;
++}
++
+ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int family)
+ {
+ 	struct inet_sk_desc *sk;
+@@ -488,6 +634,11 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
+ 
+ 	BUG_ON(sk->sd.already_dumped);
+ 
++	if (check_share_dst_port(sk->dst_port) || check_share_src_port(sk->src_port)) {
++		pr_info("Start add share prot:%d src %d\n", sk->dst_port, sk->src_port);
++		add_share_socket(id, lfd, dst_pid, sk->src_port);
++	}
++
+ 	ie.id = id;
+ 	ie.ino = sk->sd.ino;
+ 	if (sk->sd.sk_ns) {
+-- 
+2.34.1
+

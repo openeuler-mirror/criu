@@ -1,0 +1,104 @@
+From 9b556899d67d7b20c64422fbde6292528772094d Mon Sep 17 00:00:00 2001
+From: Xiaoguang Li <lixiaoguang2@huawei.com>
+Date: Mon, 29 Mar 2021 20:58:28 -0400
+Subject: [PATCH 34/72] netlink: add repair modes and clear resource when
+ failure
+
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+---
+ criu/cr-dump.c     |  3 +++
+ criu/include/net.h |  1 +
+ criu/sk-netlink.c  | 45 +++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 49 insertions(+)
+
+diff --git a/criu/cr-dump.c b/criu/cr-dump.c
+index e0e11cc..b7e0214 100644
+--- a/criu/cr-dump.c
++++ b/criu/cr-dump.c
+@@ -2073,6 +2073,9 @@ static int cr_dump_finish(int ret)
+ 	} else if (ret != 0 && opts.pin_memory) {
+ 		pr_info("clear pin mem info\n");
+ 		clear_pin_mem(0);
++	} else if (ret != 0 && opts.with_notifier_kup) {
++		pr_info("repair off netlink fd\n");
++		netlink_repair_off();
+ 	}
+ 
+ 	if (ret != 0 && opts.with_notifier_kup) {
+diff --git a/criu/include/net.h b/criu/include/net.h
+index 0da4cad..718cc45 100644
+--- a/criu/include/net.h
++++ b/criu/include/net.h
+@@ -55,5 +55,6 @@ extern void check_has_netns_ioc(int fd, bool *kdat_val, const char *name);
+ extern int net_set_ext(struct ns_id *ns);
+ extern struct ns_id *get_root_netns(void);
+ extern int read_net_ns_img(void);
++extern int netlink_repair_off(void);
+ 
+ #endif /* __CR_NET_H__ */
+diff --git a/criu/sk-netlink.c b/criu/sk-netlink.c
+index 754eed9..d4b3b7b 100644
+--- a/criu/sk-netlink.c
++++ b/criu/sk-netlink.c
+@@ -68,6 +68,47 @@ int netlink_receive_one(struct nlmsghdr *hdr, struct ns_id *ns, void *arg)
+ 	return sk_collect_one(m->ndiag_ino, PF_NETLINK, &sd->sd, ns);
+ }
+ 
++struct netlink_repair_fd {
++	int netlink_fd;
++	struct list_head nlist;
++};
++
++static LIST_HEAD(netlink_repair_fds);
++
++static int netlink_repair_on(int fd)
++{
++	int ret, aux = 1;
++	struct netlink_repair_fd *nrf;
++
++	ret = setsockopt(fd, SOL_NETLINK, TCP_REPAIR, &aux, sizeof(aux));
++	if (ret < 0) {
++		pr_err("Can't turn netlink repair mode ON, error: %d\n", ret);
++		return ret;
++	}
++	nrf = malloc(sizeof(*nrf));
++	if (!nrf)
++		return -ENOMEM;
++	nrf->netlink_fd = dup(fd);
++	list_add_tail(&nrf->nlist, &netlink_repair_fds);
++	return ret;
++}
++
++int netlink_repair_off(void)
++{
++	int aux = 0, ret;
++	struct netlink_repair_fd *nrf, *n;
++
++	list_for_each_entry_safe(nrf, n, &netlink_repair_fds, nlist) {
++		ret = setsockopt(nrf->netlink_fd, SOL_NETLINK, TCP_REPAIR, &aux, sizeof(aux));
++		if (ret < 0)
++			pr_err("Failed to turn off repair mode on netlink\n");
++		close(nrf->netlink_fd);
++		list_del(&nrf->nlist);
++		free(nrf);
++	}
++	return 0;
++}
++
+ static bool can_dump_netlink_sk(int lfd)
+ {
+ 	int ret;
+@@ -90,6 +131,10 @@ static int dump_one_netlink_fd(int lfd, u32 id, const struct fd_parms *p)
+ 	if (IS_ERR(sk))
+ 		goto err;
+ 
++        if (netlink_repair_on(lfd) < 0) {
++                goto err;
++        }
++
+ 	ne.id = id;
+ 	ne.ino = p->stat.st_ino;
+ 
+-- 
+2.34.1
+

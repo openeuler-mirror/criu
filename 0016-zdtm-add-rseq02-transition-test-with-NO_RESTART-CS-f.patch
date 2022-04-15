@@ -1,13 +1,13 @@
-From bb8295ae4f1224db2236fdd3134912e093ed20d9 Mon Sep 17 00:00:00 2001
+From dc5f32571e66ab72842e735259d0c442ed1c603b Mon Sep 17 00:00:00 2001
 From: bb-cat <ningyu9@huawei.com>
 Date: Wed, 2 Mar 2022 15:10:24 +0800
-Subject: [PATCH 16/16] zdtm: add rseq02 transition test with NO_RESTART CS
+Subject: [PATCH 16/72] zdtm: add rseq02 transition test with NO_RESTART CS
  flag Signed-off-by: Alexander Mikhalitsyn
  <alexander.mikhalitsyn@virtuozzo.com>
 
 ---
- test/zdtm/transition/Makefile    |  2 +
- test/zdtm/transition/rseq01.c    | 61 +++++++++++++++++++-
+ test/zdtm/transition/Makefile    |  2 ++
+ test/zdtm/transition/rseq01.c    | 61 ++++++++++++++++++++++++++++++--
  test/zdtm/transition/rseq02.c    |  1 +
  test/zdtm/transition/rseq02.desc |  1 +
  4 files changed, 63 insertions(+), 2 deletions(-)
@@ -173,5 +173,5 @@ index 0000000..b888f0d
 +rseq01.desc
 \ No newline at end of file
 -- 
-2.30.0
+2.34.1
 

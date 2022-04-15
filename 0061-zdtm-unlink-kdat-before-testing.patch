@@ -1,0 +1,46 @@
+From 926affe76a99871f9a95f3381190bd3fb601e6ec Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Fri, 21 Jan 2022 14:46:21 +0800
+Subject: [PATCH 61/72] zdtm: unlink kdat before testing
+
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ test/zdtm.py | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/test/zdtm.py b/test/zdtm.py
+index 0feece0..1b2c7da 100755
+--- a/test/zdtm.py
++++ b/test/zdtm.py
+@@ -24,6 +24,7 @@ import sys
+ import tempfile
+ import time
+ import socket
++import pathlib
+ from builtins import (input, int, open, range, str, zip)
+ 
+ import pycriu as crpc
+@@ -2662,6 +2663,9 @@ rp.add_argument("--pre-dump-mode",
+                 help="Use splice or read mode of pre-dumping",
+                 choices=['splice', 'read'],
+                 default='splice')
++rp.add_argument("--kdat",
++		help="Path to criu.kdat, default '/run/criu.kdat'",
++		default="/run/criu.kdat")
+ 
+ lp = sp.add_parser("list", help="List tests")
+ lp.set_defaults(action=list_tests)
+@@ -2692,6 +2696,10 @@ if opts['debug']:
+ 
+ if opts['action'] == 'run':
+     criu.available()
++    # remove kdat file before testing
++    kdat = pathlib.Path(opts['kdat'])
++    if kdat.exists():
++        kdat.unlink()
+ for tst in test_classes.values():
+     tst.available()
+ 
+-- 
+2.34.1
+

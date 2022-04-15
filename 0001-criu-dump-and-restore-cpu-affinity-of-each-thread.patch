@@ -1,7 +1,7 @@
-From 4a49af49be378835b65016d5465eae44107a52e1 Mon Sep 17 00:00:00 2001
+From 746a5dd20bb688e1d830e216059e1de7e59186a3 Mon Sep 17 00:00:00 2001
 From: "fu.lin" <fulin10@huawei.com>
 Date: Tue, 13 Apr 2021 10:39:45 +0800
-Subject: [PATCH 4/6] criu: dump and restore cpu affinity of each thread
+Subject: [PATCH 01/72] criu: dump and restore cpu affinity of each thread
 
 Criu should dump and restore threads' or processes'
 cpu affinity.
@@ -416,5 +416,5 @@ index 0000000..0d0b8ae
 @@ -0,0 +1 @@
 +{'dopts': '', 'ropts': '--with-cpu-affinity', 'flags': 'reqrst '}
 -- 
-2.27.0
+2.34.1
 

@@ -1,0 +1,256 @@
+From f7e452ffc5318b2aac8aabde5dd8b7bee910c6f7 Mon Sep 17 00:00:00 2001
+From: "fu.lin" <fulin10@huawei.com>
+Date: Thu, 17 Feb 2022 14:59:37 +0800
+Subject: [PATCH 68/72] zdtm: add infiniband testcase
+
+---
+ test/zdtm/customization/Makefile              |   4 +-
+ .../customization/infiniband_with_unix_sk.c   |  55 ++++++++
+ .../infiniband_with_unix_sk.desc              |   1 +
+ test/zdtm/mod/Makefile                        |   5 +-
+ test/zdtm/mod/infiniband_kern.c               | 121 ++++++++++++++++++
+ 5 files changed, 184 insertions(+), 2 deletions(-)
+ create mode 100644 test/zdtm/customization/infiniband_with_unix_sk.c
+ create mode 100644 test/zdtm/customization/infiniband_with_unix_sk.desc
+ create mode 100644 test/zdtm/mod/infiniband_kern.c
+
+diff --git a/test/zdtm/customization/Makefile b/test/zdtm/customization/Makefile
+index 7d08db3..728646b 100644
+--- a/test/zdtm/customization/Makefile
++++ b/test/zdtm/customization/Makefile
+@@ -12,7 +12,8 @@ TST_NOFILE	=	\
+ 		maps007	\
+ 		maps008	\
+ 		notifier00	\
+-		chardev00
++		chardev00	\
++		infiniband_with_unix_sk
+ 
+ TST_FILE	=	\
+ 		maps00	\
+@@ -61,6 +62,7 @@ wait_stop:
+ $(TST):	| $(LIB)
+ 
+ maps02: get_smaps_bits.o
++infiniband_with_unix_sk: LDFLAGS += -lpthread
+ 
+ %: %.sh
+ 	cp $< $@
+diff --git a/test/zdtm/customization/infiniband_with_unix_sk.c b/test/zdtm/customization/infiniband_with_unix_sk.c
+new file mode 100644
+index 0000000..4a9e108
+--- /dev/null
++++ b/test/zdtm/customization/infiniband_with_unix_sk.c
+@@ -0,0 +1,55 @@
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/socket.h>
++#include <stdio.h>
++#include <stdbool.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <pthread.h>
++#include "zdtmtst.h"
++
++#define DEV_PATH	"/dev/infiniband_test"
++
++const char *test_doc = "test infiniband fd checkpoint/restore, and the conflict condition with the half-closing anonymous unix socket";
++
++static int fd;
++static int sv[2];
++
++static void *wait(void *arg) {
++	while (true) {
++		test_msg("sleep...\n");
++		sleep(1);
++	}
++
++	return NULL;
++}
++
++int main(int argc, char *argv[]) {
++	pthread_t thread;
++
++	test_init(argc, argv);
++
++	if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) {
++		pr_perror("socketpair");
++		return -1;
++	}
++	printf("sv[0]: %d sv[1]: %d\n", sv[0], sv[1]);
++
++	if ((fd = open(DEV_PATH, O_RDWR)) < 0) {
++		pr_perror("open");
++		return -1;
++	}
++	if (close(sv[1]) < 0) {
++		pr_perror("close");
++		return -1;
++	}
++
++	pthread_create(&thread, NULL, wait, NULL);
++
++	test_daemon();
++	test_waitsig();
++
++	pass();
++
++	return 0;
++}
+diff --git a/test/zdtm/customization/infiniband_with_unix_sk.desc b/test/zdtm/customization/infiniband_with_unix_sk.desc
+new file mode 100644
+index 0000000..43a93e6
+--- /dev/null
++++ b/test/zdtm/customization/infiniband_with_unix_sk.desc
+@@ -0,0 +1 @@
++{'arch': 'aarch64', 'opts': '--dump-char-dev', 'flavor': 'h', 'flags': 'suid excl', 'sysfs': '/sys/kernel/repairing_device', 'mod': 'infiniband_kern.ko'}
+diff --git a/test/zdtm/mod/Makefile b/test/zdtm/mod/Makefile
+index 0bc89f7..58f9a27 100644
+--- a/test/zdtm/mod/Makefile
++++ b/test/zdtm/mod/Makefile
+@@ -2,7 +2,7 @@
+ #   `ARCH` var is used in both criu and kernel, but they have the different value
+ #   for the same architecture(e.g. arm64). Therefore, this Makefile can't be
+ #   included in the criu Makefile.
+-obj-m += notifier.o anon_inode.o
++obj-m += notifier.o anon_inode.o infiniband_kern.o
+ 
+ # specific the kernel devel path
+ # example (use `/home/me/kernel` as `KDIR`):
+@@ -29,3 +29,6 @@ notifier.ko:
+ 
+ anon_inode.ko:
+ 	$(MAKE) -C $(KDIR) M=$(MOD) anon_inode.ko
++
++infiniband_kern.ko:
++	$(MAKE) -C $(KDIR) M=$(MOD) infiniband_kern.ko
+diff --git a/test/zdtm/mod/infiniband_kern.c b/test/zdtm/mod/infiniband_kern.c
+new file mode 100644
+index 0000000..a61df3a
+--- /dev/null
++++ b/test/zdtm/mod/infiniband_kern.c
+@@ -0,0 +1,121 @@
++#define pr_fmt(fmt)	KBUILD_MODNAME	": " fmt
++
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/miscdevice.h>
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include <linux/mman.h>
++#include <linux/anon_inodes.h>
++#include <linux/file.h>
++#include <linux/modrestore.h>
++#include <linux/uaccess.h>
++
++static const struct file_operations none_fops = {
++	.owner = THIS_MODULE,
++};
++
++static const struct file_operations anonfd_fops = {
++	.owner = THIS_MODULE,
++};
++
++static int infiniband_open(struct inode *inode, struct file *filp)
++{
++	long fd;
++
++	if (!!(filp->f_flags & O_REPAIR)) {
++		pr_info("reuse\n");
++		return 0;
++	}
++
++	fd = anon_inode_getfd("[infinibandevent]", &anonfd_fops, NULL, 0);
++	if (fd < 0)
++		return fd;
++	else
++		filp->private_data = (void *)fd;
++
++	return 0;
++}
++
++static int infiniband_repair(struct file *filp, int from)
++{
++	struct file *fp;
++	long fd;
++	int retval = 0;
++
++	fp = anon_inode_getfile("[infinibandevent]", &anonfd_fops, NULL, 0);
++	if (IS_ERR(fp))
++		return PTR_ERR(fp);
++
++	fd = mures_f_dupfd(from, fp, 0);
++	if (fd != from) {
++		pr_err("different fd, old: %d, dup: %ld\n", from, fd);
++		retval = -EEXIST;
++	}
++	fput(fp);
++	filp->private_data = (long *)fd;
++
++	return retval;
++}
++
++static long infiniband_ioctl(struct file *filp, unsigned int cmd, unsigned long argp)
++{
++	long retval = 0;
++
++	switch (cmd) {
++		case IOCTL_CMD_NEEDREPAIR:
++			retval = (long )filp->private_data;
++			break;
++		case IOCTL_CMD_REPAIR:
++			retval = infiniband_repair(filp, argp);
++			break;
++		default:
++			pr_warn("wrong cmd\n");
++			return -EINVAL;
++	}
++	return retval;
++}
++
++static const struct file_operations infiniband_fops = {
++	.owner = THIS_MODULE,
++	.open = infiniband_open,
++	.unlocked_ioctl = infiniband_ioctl,
++	.compat_ioctl = infiniband_ioctl,
++};
++
++static struct miscdevice infiniband_dev = {
++	.minor  = MISC_DYNAMIC_MINOR,
++	.name = "infiniband_test",
++	.fops = &infiniband_fops,
++};
++
++static int __init infiniband_init(void)
++{
++	int retval;
++
++	retval = mures_add_devname(infiniband_dev.name);
++	if (retval != 0)
++		goto out;
++
++	retval = misc_register(&infiniband_dev);
++	if (retval != 0)
++		goto del_devname;
++
++	return 0;
++
++del_devname:
++	mures_del_devname(infiniband_dev.name);
++out:
++	return retval;
++}
++
++static void __exit infiniband_exit(void)
++{
++	mures_del_devname(infiniband_dev.name);
++	misc_deregister(&infiniband_dev);
++	return;
++}
++
++module_init(infiniband_init);
++module_exit(infiniband_exit);
++MODULE_LICENSE("GPL");
+-- 
+2.34.1
+

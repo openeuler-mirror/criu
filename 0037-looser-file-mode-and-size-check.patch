@@ -1,0 +1,90 @@
+From bb60f8e71ec85dd11666bbb395508fac4403c251 Mon Sep 17 00:00:00 2001
+From: Jingxian He <hejingxian@huawei.com>
+Date: Sat, 26 Jun 2021 11:41:18 +0800
+Subject: [PATCH 37/72] looser file mode and size check
+
+When the file mode and size larger than dump data,
+make the restoring process run success.
+
+Conflict:NA
+Reference:https://gitee.com/src-openeuler/criu/pulls/21
+Signed-off-by: Jingxian He <hejingxian@huawei.com>
+Signed-off-by: fu.lin <fulin10@huawei.com>
+---
+ criu/config.c             |  1 +
+ criu/crtools.c            |  1 +
+ criu/files-reg.c          | 14 +++++++++++---
+ criu/include/cr_options.h |  1 +
+ 4 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/criu/config.c b/criu/config.c
+index bd0f84d..a9eb699 100644
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -704,6 +704,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		BOOL_OPT("dump-char-dev", &opts.dump_char_dev),
+ 		BOOL_OPT("with-fd-cred", &opts.with_fd_cred),
+ 		BOOL_OPT("mask-exit-notify", &opts.mask_exit_notify),
++		BOOL_OPT("weak-file-check", &opts.weak_file_check),
+ 		{},
+ 	};
+ 
+diff --git a/criu/crtools.c b/criu/crtools.c
+index 1a41be4..e1afeca 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -455,6 +455,7 @@ usage:
+ 	       \
+ 	       "  --with-fd-cred	Allow to make the restored process has the same cred\n"
+ 	       "  --mask-exit-notify	Mask task exit notify during dump and restore\n"
++	       "  --weak-file-check	Allow file size and mod larger than dumping value\n"
+ 	       "\n"
+ 	       "Check options:\n"
+ 	       "  Without options, \"criu check\" checks availability of absolutely required\n"
+diff --git a/criu/files-reg.c b/criu/files-reg.c
+index 7bd8592..1a3b836 100644
+--- a/criu/files-reg.c
++++ b/criu/files-reg.c
+@@ -1991,7 +1991,10 @@ static bool validate_file(const int fd, const struct stat *fd_status, const stru
+ {
+ 	int result = 1;
+ 
+-	if (rfi->rfe->has_size && (fd_status->st_size != rfi->rfe->size)) {
++	/* NOTICE: customize for the storage module upgrade feature */
++	if (rfi->rfe->has_size
++		&& ((!opts.weak_file_check && fd_status->st_size != rfi->rfe->size)
++		    || (fd_status->st_size < rfi->rfe->size))) {
+ 		pr_err("File %s has bad size %" PRIu64 " (expect %" PRIu64 ")\n", rfi->path, fd_status->st_size,
+ 		       rfi->rfe->size);
+ 		return false;
+@@ -2102,8 +2105,13 @@ ext:
+ 		if (!validate_file(tmp, &st, rfi))
+ 			return -1;
+ 
+-		if (rfi->rfe->has_mode && (st.st_mode != rfi->rfe->mode)) {
+-			pr_err("File %s has bad mode 0%o (expect 0%o)\n", rfi->path, (int)st.st_mode, rfi->rfe->mode);
++		/* NOTICE: customize for the storage module upgrade feature */
++		if (rfi->rfe->has_mode
++		    && ((!opts.weak_file_check && st.st_mode != rfi->rfe->mode)
++			|| (st.st_mode < rfi->rfe->mode))) {
++			pr_err("File %s has bad mode 0%o (expect 0%o), weak check %d\n",
++			       rfi->path, (int)st.st_mode, rfi->rfe->mode,
++			       opts.weak_file_check);
+ 			return -1;
+ 		}
+ 
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index 26ae5b6..dec0082 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -196,6 +196,7 @@ struct cr_options {
+ 	int dump_char_dev;
+ 	int with_fd_cred;
+ 	int mask_exit_notify;
++	int weak_file_check;
+ };
+ 
+ extern struct cr_options opts;
+-- 
+2.34.1
+
