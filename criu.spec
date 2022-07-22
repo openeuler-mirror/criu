@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.16.1
-Release:       3
+Release:       4
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -158,7 +158,7 @@ chmod 0755 %{buildroot}/run/%{name}/
 %exclude %{_libdir}/libcriu.a
 
 %files -n python3-criu
-%{python3_sitelib}/{pycriu/*,*egg-info}
+%{python3_sitelib}/crit-0.0.1-py%{python3_version}.egg
 
 %files -n crit
 %{_bindir}/crit
@@ -167,8 +167,37 @@ chmod 0755 %{buildroot}/run/%{name}/
 %{_sbindir}/criu-ns
 
 %files help
-%doc README.md COPYING
+%doc COPYING
 %doc %{_mandir}/man8/criu.8*
 %doc %{_mandir}/man1/{compel.1*,crit.1*,criu-ns.1*}
 
 %changelog
+* Fri Jul 22 2022 tenglei <tenglei@kylinos.cn> - 3.16.1-4
+- Remove non-compliant README files
+- fix files not found egg-info
+- move changelog into spec file
+
+* Wed Apr 13 2022 fu.lin <fulin10@huawei.com> - 3.16.1-3
+- backport kinds of feature/bugfix
+- spec: split changelog
+
+* Fri Mar 4 2022 ningyu <ningyu9@huawei.com> - 3.16.1-2
+- rseq c/r support
+
+* Thu Dec 2 2021 zhouwenpei <zhouwenpei11@huawei.com> - 3.16.1-1
+- upgrade criu version to 3.16.1
+
+* Tue Sep 07 2021 chenchen <chen_aka_jan@163.com> - 3.15-4
+- add "-fstack-protector-strong" for libcriu.so.2.0
+
+* Mon May 31 2021 baizhonggui <baizhonggui@huawei.com> - 3.15-3
+- Add gcc in BuildRequires
+
+* Thu Apr 08 2021 fu.lin <fulin10@huawei.com> - 3.15-1
+- bump the criu version to v3.15
+
+* Tue Sep 22 2020 lingsheng <lingsheng@huawei.com> - 3.13-7
+- Fix crit errors
+
+* Fri Apr 24 2020 wutao <wutao61@huawei.com> - 3.13-6
+- Package init
