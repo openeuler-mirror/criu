@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.16.1
-Release:       3
+Release:       4
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -114,6 +114,9 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*,criu-ns.1*}
 
 %changelog
+* Wed Oct 19 2022 fu.lin <fulin10@huawei.com> -3.16.1-4
+- bump the version
+
 * Fri Mar 4 2022 ningyu <ningyu9@huawei.com> - 3.16.1-3
 - rseq c/r support
 
