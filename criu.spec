@@ -1,12 +1,12 @@
 Name:          criu
 Version:       3.16.1
-Release:       4
+Release:       5
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
 License:       GPL-2.0-or-later or LGPL-2.1-only
 URL:           http://criu.org/
-Source0:       http://github.com/chechpoint-restore/criu/archive/v%{version}/%{name}-%{version}.tar.gz
+Source0:       http://github.com/checkpoint-restore/criu/archive/v%{version}/%{name}-%{version}.tar.gz
 BuildRequires: systemd libnet-devel asciidoc xmlto perl-interpreter libselinux-devel gcc
 BuildRequires: protobuf-devel protobuf-c-devel python3-devel libnl3-devel libcap-devel
 Recommends:    tar
@@ -114,6 +114,9 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*,criu-ns.1*}
 
 %changelog
+* Thu Nov 10 2022 caodongxia <caodongxia@h-partners.com> - 3.16.1-5
+- Modify invalid source0
+
 * Wed Oct 19 2022 fu.lin <fulin10@huawei.com> -3.16.1-4
 - bump the version
 
