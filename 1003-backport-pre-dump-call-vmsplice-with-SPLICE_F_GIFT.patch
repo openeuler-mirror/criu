@@ -1,0 +1,28 @@
+From efeedf3912df4a9a13d5ac719700ca06a9dad327 Mon Sep 17 00:00:00 2001
+From: Andrei Vagin <avagin@gmail.com>
+Date: Wed, 27 Apr 2022 07:02:58 +0300
+Subject: [PATCH] pre-dump: call vmsplice with SPLICE_F_GIFT
+
+In this case, vmplice attaches pages without coping them.
+
+Signed-off-by: Andrei Vagin <avagin@gmail.com>
+---
+ criu/page-xfer.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/criu/page-xfer.c b/criu/page-xfer.c
+index 3d29fbf78..2a9f6e2cc 100644
+--- a/criu/page-xfer.c
++++ b/criu/page-xfer.c
+@@ -822,7 +822,7 @@ int page_xfer_predump_pages(int pid, struct page_xfer *xfer, struct page_pipe *p
+ 
+ 		bufvec.iov_base = userbuf;
+ 		bufvec.iov_len = bytes_read;
+-		ret = vmsplice(ppb->p[1], &bufvec, 1, SPLICE_F_NONBLOCK);
++		ret = vmsplice(ppb->p[1], &bufvec, 1, SPLICE_F_NONBLOCK | SPLICE_F_GIFT);
+ 
+ 		if (ret == -1 || ret != bytes_read) {
+ 			pr_err("vmsplice: Failed to splice user buffer to pipe %ld\n", ret);
+-- 
+2.33.0
+

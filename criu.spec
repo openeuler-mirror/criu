@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.16.1
-Release:       6
+Release:       7
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -34,7 +34,10 @@ Patch16:    0015-cr-dump-handle-rseq-flags-field.patch
 Patch17:    0016-zdtm-add-rseq02-transition-test-with-NO_RESTART-CS-f.patch
 
 Patch1000:  1000-backport-page-pipe-fix-limiting-a-pipe-size.patch
-
+Patch1001:  1001-backport-tty-fix-the-null-pointer-of-get_tty_driver.patch
+Patch1002:  1002-backport-criu-files-Don-t-cache-fd-ids-for-device-files.patch
+Patch1003:  1003-backport-pre-dump-call-vmsplice-with-SPLICE_F_GIFT.patch
+ 
 %description
 Checkpoint/Restore in Userspace(CRIU),is a software tool for the linux operating system.
 Using this tool,it is possible to freeze a running application (or part of it) and
@@ -116,6 +119,11 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*,criu-ns.1*}
 
 %changelog
+* Tue Nov 22 2022 Hewenliang <hewenliang4@huawei.com> - 3.16.1-7
+- fix the null pointer of get_tty_driver.
+- criu files Dont cache fd ids for device files.
+- pre dump call vmsplice with SPLICE_F_GIFT.
+
 * Tue Nov 22 2022 Hewenliang <hewenliang4@huawei.com> - 3.16.1-6
 - page-pipe:fix-limiting a pipe size.
 
