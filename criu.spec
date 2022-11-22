@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.16.1
-Release:       5
+Release:       6
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -32,6 +32,8 @@ Patch14:    0013-cr-dump-fixup-thread-IP-when-inside-rseq-cs.patch
 Patch15:    0014-zdtm-add-rseq-transition-test-for-amd64.patch
 Patch16:    0015-cr-dump-handle-rseq-flags-field.patch
 Patch17:    0016-zdtm-add-rseq02-transition-test-with-NO_RESTART-CS-f.patch
+
+Patch1000:  1000-backport-page-pipe-fix-limiting-a-pipe-size.patch
 
 %description
 Checkpoint/Restore in Userspace(CRIU),is a software tool for the linux operating system.
@@ -114,6 +116,9 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*,criu-ns.1*}
 
 %changelog
+* Tue Nov 22 2022 Hewenliang <hewenliang4@huawei.com> - 3.16.1-6
+- page-pipe:fix-limiting a pipe size.
+
 * Thu Nov 10 2022 caodongxia <caodongxia@h-partners.com> - 3.16.1-5
 - Modify invalid source0
 

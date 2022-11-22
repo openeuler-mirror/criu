@@ -1,0 +1,36 @@
+From 51533d98ac389711a704266a1a5d7afc9b267f2d Mon Sep 17 00:00:00 2001
+From: Andrei Vagin <avagin@gmail.com>
+Date: Wed, 27 Apr 2022 06:51:47 +0300
+Subject: [PATCH] page-pipe: fix limiting a pipe size
+
+But actually, 5a92f100b88e probably has to be reverted as a whole.
+PIPE_MAX_SIZE is the hard limit to avoid PAGE_ALLOC_COSTLY_ORDER
+allocations in the kernel. But F_SETPIPE_SZ rounds up a requested pipe
+size to a power-of-2 pages. It means that when we request PIPE_MAX_SIZE
+that isn't a power-of-2 number, we actually request a pipe size greater
+than PIPE_MAX_SIZE.
+
+Fixes: 5a92f100b88e ("page-pipe: Resize up to PIPE_MAX_SIZE")
+
+Signed-off-by: Andrei Vagin <avagin@gmail.com>
+Signed-off-by: He Wenliang <hewenliang4@huawei.com>
+---
+ criu/page-pipe.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/criu/page-pipe.c b/criu/page-pipe.c
+index 5a7e50bc1..54dc3ccc4 100644
+--- a/criu/page-pipe.c
++++ b/criu/page-pipe.c
+@@ -56,7 +56,7 @@ static inline int ppb_resize_pipe(struct page_pipe_buf *ppb)
+ 
+ 	if (new_size > PIPE_MAX_SIZE) {
+ 		if (ppb->pipe_size < PIPE_MAX_SIZE)
+-			ppb->pipe_size = PIPE_MAX_SIZE;
++			new_size = PIPE_MAX_SIZE;
+ 		else
+ 			return 1;
+ 	}
+-- 
+2.33.0
+
