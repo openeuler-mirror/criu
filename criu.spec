@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.16.1
-Release:       4
+Release:       5
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -90,6 +90,8 @@ Patch:      0070-zdtm-tmp-test-script.patch
 Patch:      0071-mod-add-criu-indepent-test.patch
 Patch:      0072-kabichk-add-KABI-check-code.patch
 %endif
+Patch:      0073-criu-fix-conflicting-headers.patch
+Patch:      0074-mount-add-definition-for-FSOPEN_CLOEXEC.patch
 
 %description
 Checkpoint/Restore in Userspace(CRIU),is a software tool for the linux operating system.
@@ -172,6 +174,9 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*,criu-ns.1*}
 
 %changelog
+* Wed Jan 4 2023 zhoujie <zhoujie133@huawei.com> - 3.16.1-5
+- Fix compilation problems caused by glibc upgrade
+
 * Fri Jul 22 2022 tenglei <tenglei@kylinos.cn> - 3.16.1-4
 - Remove non-compliant README files
 - fix files not found egg-info
