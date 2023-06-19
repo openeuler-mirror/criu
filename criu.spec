@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.16.1
-Release:       8
+Release:       9
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -17,6 +17,7 @@ Obsoletes:     %{name}-libs < %{version}-%{release}
 
 Patch1:     0001-criu-dump-and-restore-cpu-affinity-of-each-thread.patch
 Patch2:     0002-mm-add-pin-memory-method-for-criu.patch
+Patch3:     revert-fix-BUG-at-criu-pstree.c-452.patch
 
 Patch1000:  1000-backport-page-pipe-fix-limiting-a-pipe-size.patch
 Patch1001:  1001-backport-tty-fix-the-null-pointer-of-get_tty_driver.patch
@@ -104,6 +105,9 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*,criu-ns.1*}
 
 %changelog
+* Mon Jun 19 2023 hewenliang <314264452@qq.com> - 3.16.1-9
+- revert: fix BUG at criu/pstree.c:452
+
 * Mon Jun 19 2023 hewenliang <314264452@qq.com> - 3.16.1-8
 - revert "rseq c/r support"
 
