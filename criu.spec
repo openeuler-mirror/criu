@@ -1,6 +1,6 @@
 Name:          criu
 Version:       3.16.1
-Release:       5
+Release:       6
 Provides:      crtools = %{version}-%{release}
 Obsoletes:     crtools <= 1.0-2
 Summary:       A tool of Checkpoint/Restore in User-space
@@ -92,6 +92,9 @@ Patch:      0072-kabichk-add-KABI-check-code.patch
 %endif
 Patch:      0073-criu-fix-conflicting-headers.patch
 Patch:      0074-mount-add-definition-for-FSOPEN_CLOEXEC.patch
+%if "%toolchain" == "clang"
+Patch:      0075-fix-clang.patch
+%endif
 
 %description
 Checkpoint/Restore in Userspace(CRIU),is a software tool for the linux operating system.
@@ -137,6 +140,9 @@ Help documents for criu.
 %autosetup -n %{name}-%{version} -p1
 
 %build
+%if "%toolchain" == "clang"
+	export LDFLAGS=`echo $LDFLAGS | sed 's/-fno-openmp-implicit-rpath//g'`
+%endif
 CFLAGS+=`echo %{optflags}` make V=1 WERROR=0 PREFIX=%{_prefix} RUNDIR=/run/criu PYTHON=python3
 
 %install
@@ -174,6 +180,9 @@ chmod 0755 %{buildroot}/run/%{name}/
 %doc %{_mandir}/man1/{compel.1*,crit.1*,criu-ns.1*}
 
 %changelog
+* Fri Jul 14 2023 yoo <sunyuechi@iscas.ac.cn> - 3.16.1-6
+- fix clang build error
+
 * Wed Jan 4 2023 zhoujie <zhoujie133@huawei.com> - 3.16.1-5
 - Fix compilation problems caused by glibc upgrade
 
