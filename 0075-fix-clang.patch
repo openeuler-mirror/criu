@@ -1,0 +1,179 @@
+diff -u -r criu-3.16.1/compel/test/fdspy/Makefile criu-3.16.1/compel/test/fdspy/Makefile
+--- criu-3.16.1/compel/test/fdspy/Makefile	2021-10-14 13:44:30.000000000 +0800
++++ criu-3.16.1/compel/test/fdspy/Makefile	2023-07-14 12:04:56.000000000 +0800
+@@ -1,4 +1,4 @@
+-CC	:= gcc
++CC	?= gcc
+ CFLAGS	?= -O2 -g -Wall -Werror
+ 
+ COMPEL		:= ../../../compel/compel-host
+diff -u -r criu-3.16.1/compel/test/infect/Makefile criu-3.16.1/compel/test/infect/Makefile
+--- criu-3.16.1/compel/test/infect/Makefile	2021-10-14 13:44:30.000000000 +0800
++++ criu-3.16.1/compel/test/infect/Makefile	2023-07-14 12:05:03.000000000 +0800
+@@ -1,4 +1,4 @@
+-CC	:= gcc
++CC	?= gcc
+ CFLAGS	?= -O2 -g -Wall -Werror
+ 
+ COMPEL		:= ../../../compel/compel-host
+diff -u -r criu-3.16.1/compel/test/rsys/Makefile criu-3.16.1/compel/test/rsys/Makefile
+--- criu-3.16.1/compel/test/rsys/Makefile	2021-10-14 13:44:30.000000000 +0800
++++ criu-3.16.1/compel/test/rsys/Makefile	2023-07-14 12:04:49.000000000 +0800
+@@ -1,4 +1,4 @@
+-CC	:= gcc
++CC	?= gcc
+ CFLAGS	?= -O2 -g -Wall -Werror
+ 
+ COMPEL		:= ../../../compel/compel-host
+diff -u -r criu-3.16.1/scripts/ci/docker.env criu-3.16.1/scripts/ci/docker.env
+--- criu-3.16.1/scripts/ci/docker.env	2021-10-14 13:44:30.000000000 +0800
++++ criu-3.16.1/scripts/ci/docker.env	2023-07-14 11:51:52.000000000 +0800
+@@ -1,4 +1,4 @@
+ SKIP_CI_PREP=1
+ ZDTM_OPTS=-x zdtm/static/binfmt_misc -x zdtm/static/sched_policy00
+-CC=gcc
++CC=clang
+ SKIP_EXT_DEV_TEST=1
+diff -u -r criu-3.16.1/scripts/ci/run-ci-tests.sh criu-3.16.1/scripts/ci/run-ci-tests.sh
+--- criu-3.16.1/scripts/ci/run-ci-tests.sh	2021-10-14 13:44:30.000000000 +0800
++++ criu-3.16.1/scripts/ci/run-ci-tests.sh	2023-07-14 12:06:23.000000000 +0800
+@@ -36,7 +36,7 @@
+ 	# This can fail on aarch64 travis
+ 	service apport stop || :
+ 
+-	if [ "$CLANG" = "1" ]; then
++	if [ "$CC" = "clang" ]; then
+ 		# clang support
+ 		CC=clang
+ 		# If this is running in an environment without gcc installed
+diff -u -r criu-3.16.1/scripts/nmk/scripts/tools.mk criu-3.16.1/scripts/nmk/scripts/tools.mk
+--- criu-3.16.1/scripts/nmk/scripts/tools.mk	2021-10-14 13:44:30.000000000 +0800
++++ criu-3.16.1/scripts/nmk/scripts/tools.mk	2023-07-14 11:52:23.000000000 +0800
+@@ -7,7 +7,7 @@
+ ifeq ($(origin LD), default)
+ LD		:= $(CROSS_COMPILE)$(HOSTLD)
+ endif
+-HOSTCC		?= gcc
++HOSTCC		?= clang
+ ifeq ($(origin CC), default)
+ CC		:= $(CROSS_COMPILE)$(HOSTCC)
+ endif
+diff -u -r criu-3.16.1/test/others/app-emu/job/Makefile criu-3.16.1/test/others/app-emu/job/Makefile
+--- criu-3.16.1/test/others/app-emu/job/Makefile	2021-10-14 13:44:30.000000000 +0800
++++ criu-3.16.1/test/others/app-emu/job/Makefile	2023-07-14 12:01:22.000000000 +0800
+@@ -2,10 +2,10 @@
+ .PHONY: all
+ 
+ %.o: %.c
+-	gcc -c $< -o $@
++	$(CC) -c $< -o $@
+ 
+ job: job.o
+-	gcc -o $@ job.o
++	$(CC) -o $@ job.o
+ 
+ clean:
+ 	rm -f *.o job
+diff -u -r criu-3.16.1/test/others/app-emu/make/Makefile criu-3.16.1/test/others/app-emu/make/Makefile
+--- criu-3.16.1/test/others/app-emu/make/Makefile	2021-10-14 13:44:30.000000000 +0800
++++ criu-3.16.1/test/others/app-emu/make/Makefile	2023-07-14 12:03:31.000000000 +0800
+@@ -3,7 +3,7 @@
+ .PHONY: all
+ 
+ %.o: %.c
+-	gcc -c $< -o $@
++	$(CC) -c $< -o $@
+ 
+ foo%.c: tmpl.c
+ 	cp $< $@
+diff -u -r criu-3.16.1/test/others/ext-links/Makefile criu-3.16.1/test/others/ext-links/Makefile
+--- criu-3.16.1/test/others/ext-links/Makefile	2021-10-14 13:44:30.000000000 +0800
++++ criu-3.16.1/test/others/ext-links/Makefile	2023-07-14 12:03:28.000000000 +0800
+@@ -1,4 +1,4 @@
+ all: mvlink.so
+ 
+ mvlink.so: mvlink.c
+-	gcc -g -Werror -Wall -shared -nostartfiles mvlink.c -o mvlink.so -iquote ../../../criu/include -fPIC
++	$(CC) -g -Werror -Wall -shared -nostartfiles mvlink.c -o mvlink.so -iquote ../../../criu/include -fPIC
+diff -u -r criu-3.16.1/test/others/libcriu/Makefile criu-3.16.1/test/others/libcriu/Makefile
+--- criu-3.16.1/test/others/libcriu/Makefile	2021-10-14 13:44:30.000000000 +0800
++++ criu-3.16.1/test/others/libcriu/Makefile	2023-07-14 12:03:37.000000000 +0800
+@@ -16,13 +16,13 @@
+ 
+ define genb
+ $(1): $(1).o lib.o
+-	gcc $$^ -L ../../../../criu/lib/c/ -L ../../../../criu/images/ -lcriu -o $$@
++	$(CC) $$^ -L ../../../../criu/lib/c/ -L ../../../../criu/images/ -lcriu -o $$@
+ endef
+ 
+ $(foreach t, $(TESTS), $(eval $(call genb, $(t))))
+ 
+ %.o: %.c
+-	gcc -c $^ -iquote ../../../../criu/criu/include -I../../../../criu/lib/c/ -I../../../../criu/images/ -o $@ -Werror
++	$(CC) -c $^ -iquote ../../../../criu/criu/include -I../../../../criu/lib/c/ -I../../../../criu/images/ -o $@ -Werror
+ 
+ clean: libcriu_clean
+ 	rm -rf $(TESTS) $(TESTS:%=%.o) lib.o
+diff -u -r criu-3.16.1/test/others/Makefile criu-3.16.1/test/others/Makefile
+--- criu-3.16.1/test/others/Makefile	2021-10-14 13:44:30.000000000 +0800
++++ criu-3.16.1/test/others/Makefile	2023-07-14 12:03:25.000000000 +0800
+@@ -1,2 +1,2 @@
+ loop:
+-	gcc -Wall loop.c -o loop
++	$(CC) -Wall loop.c -o loop
+diff -u -r criu-3.16.1/test/others/mounts/ext/Makefile criu-3.16.1/test/others/mounts/ext/Makefile
+--- criu-3.16.1/test/others/mounts/ext/Makefile	2021-10-14 13:44:30.000000000 +0800
++++ criu-3.16.1/test/others/mounts/ext/Makefile	2023-07-14 12:01:34.000000000 +0800
+@@ -1,13 +1,13 @@
+ all: ext-mount.so ns_init
+ 
+ ext-mount.so: ext-mount.c
+-	gcc -g -Werror -Wall -shared -nostartfiles ext-mount.c -o ext-mount.so -iquote ../../../include -fPIC
++	$(CC) -g -Werror -Wall -shared -nostartfiles ext-mount.c -o ext-mount.so -iquote ../../../include -fPIC
+ 
+ ns_init: ns_init.o
+-	gcc -static $< -o $@
++	$(CC) -static $< -o $@
+ 
+ ns_init.o: ns_init.c
+-	gcc -c $< -o $@
++	$(CC) -c $< -o $@
+ 
+ run: all
+ 	./run.sh
+diff -u -r criu-3.16.1/test/others/unix-callback/Makefile criu-3.16.1/test/others/unix-callback/Makefile
+--- criu-3.16.1/test/others/unix-callback/Makefile	2021-10-14 13:44:30.000000000 +0800
++++ criu-3.16.1/test/others/unix-callback/Makefile	2023-07-14 12:01:53.000000000 +0800
+@@ -7,16 +7,16 @@
+ 	protoc-c --proto_path=. --c_out=. unix.proto
+ 
+ unix-lib.so: unix-lib.c unix.pb-c.c
+-	gcc -g -Werror -Wall -shared -nostartfiles unix-lib.c unix.pb-c.c -o unix-lib.so -iquote ../../../criu/include -fPIC
++	$(CC) -g -Werror -Wall -shared -nostartfiles unix-lib.c unix.pb-c.c -o unix-lib.so -iquote ../../../criu/include -fPIC
+ 
+ syslog-lib.so: syslog-lib.c
+-	gcc -g -Werror -Wall -shared -nostartfiles syslog-lib.c -o syslog-lib.so -iquote ../../../criu/include -fPIC
++	$(CC) -g -Werror -Wall -shared -nostartfiles syslog-lib.c -o syslog-lib.so -iquote ../../../criu/include -fPIC
+ 
+ unix-server: unix-server.c
+-	gcc -Werror -Wall -o unix-server unix-server.c
++	$(CC) -Werror -Wall -o unix-server unix-server.c
+ 
+ unix-client: unix-client.c
+-	gcc -Werror -Wall -o unix-client unix-client.c
++	$(CC) -Werror -Wall -o unix-client unix-client.c
+ 
+ clean:
+ 	rm -rf data unix-lib.so unix-server unix-client syslog-lib.so output pid unix.pb-c.*
+diff -u -r criu-3.16.1/test/zdtm/Makefile.inc criu-3.16.1/test/zdtm/Makefile.inc
+--- criu-3.16.1/test/zdtm/Makefile.inc	2021-10-14 13:44:30.000000000 +0800
++++ criu-3.16.1/test/zdtm/Makefile.inc	2023-07-14 11:52:31.000000000 +0800
+@@ -33,7 +33,7 @@
+         endif
+ endif
+ 
+-HOSTCC	?= gcc
++HOSTCC	?= clang
+ ifeq ($(origin CC), default)
+         CC := $(CROSS_COMPILE)$(HOSTCC)
+ endif
